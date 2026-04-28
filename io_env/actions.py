@@ -273,6 +273,12 @@ class DesignActions:
         new_ops.insert(min(fuse_indices), fused)
         new_graph.operations = new_ops
 
+        # Clean up dangling references: remaining ops that read internal
+        # intermediates of the fused group should have those refs removed
+        for op in new_graph.operations:
+            if op is not fused:
+                op.reads = [r for r in op.reads if r not in internal_names]
+
         return new_graph
 
     @staticmethod
