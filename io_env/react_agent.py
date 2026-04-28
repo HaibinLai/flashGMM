@@ -226,11 +226,18 @@ Phase 3 — Iterate if Needed:
      * A @triton.jit kernel function
      * A flash_<task>(...) wrapper function
      * A reference_<task>(...) function (can use PyTorch for reference)
-   - Key optimization techniques to consider:
-     * Use 2D tiling (tile over both rows and columns)
-     * Use tl.dot for matrix multiply (maps to Tensor Cores)
-     * Maximize occupancy with appropriate BLOCK sizes
-     * Minimize global memory reads with shared memory / register reuse
+   - Key Triton optimization techniques:
+     * Online 2-pass softmax is BETTER than 3-pass (max+sum+normalize). Keep it 2-pass!
+     * Use LARGE BLOCK sizes (512-1024) for better memory throughput
+     * Use num_warps=4 or 8 for wide rows
+     * Accumulate in registers, write once — minimize tl.store calls
+     * For matmul patterns, use tl.dot (maps to Tensor Cores)
+     * Do NOT add extra passes over data — each HBM read costs ~100ns
+     * VECTORIZE: process BLOCK_SIZE elements per tl.load, not 1
+   - Common mistakes to AVOID:
+     * Writing a 3-pass kernel when 2-pass online algorithm works
+     * Using scalar loops inside @triton.jit (use tl.arange + vectorized ops)
+     * Small BLOCK_SIZE (< 128) causing low memory bandwidth utilization
 9. Repeat compile_and_test + benchmark_kernel until speedup >= 1.0×
 
 ## RULES
@@ -496,13 +503,19 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
         obs = benchmark_kernel(self.task_name, self.params, filepath)
         # Extract speedup for reward
         reward = 0.0
+        speedup_val = 1.0
         for line in obs.split("\n"):
             if "Speedup:" in line:
                 try:
-                    spd = float(line.split(":")[-1].strip().rstrip("×"))
-                    reward = 3.0 * (spd - 1.0)
+                    speedup_val = float(line.split(":")[-1].strip().rstrip("×"))
+                    reward = 3.0 * (speedup_val - 1.0)
                 except ValueError:
                     pass
+        # If kernel is slow, show the current code so agent can improve it
+        if speedup_val < 1.0 and filepath and os.path.exists(filepath):
+            with open(filepath) as f:
+                code = f.read()
+            obs += "\n\n=== CURRENT KERNEL CODE (needs improvement) ===\n" + code
         return obs, max(reward, 0.0), False
 
     def _tool_done(self) -> tuple[str, float, bool]:

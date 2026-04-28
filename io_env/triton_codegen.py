@@ -166,11 +166,14 @@ def _flash_softmax_kernel(
     BM: tl.constexpr,
 ):
     """
-    Flash row-wise softmax: online softmax, no intermediate materialization.
+    Flash row-wise softmax: 2-pass online softmax, no intermediate materialization.
+    Pass 1: streaming online max + sum_exp (reads X once)
+    Pass 2: normalize and write output (reads X again, writes OUT)
+    Total: 2 reads of X + 1 write of OUT. No intermediate in HBM.
     """
     row = tl.program_id(0)
 
-    # Pass 1: online max + sum_exp
+    # Pass 1: online max + sum_exp (single streaming pass)
     m = float("-inf")
     s = 0.0
     for col_start in range(0, M, BM):
@@ -182,21 +185,23 @@ def _flash_softmax_kernel(
         s = s * tl.exp(m - new_m) + tl.sum(tl.exp(x - new_m))
         m = new_m
 
-    # Pass 2: normalize (recompute exp)
+    # Pass 2: normalize (recompute exp, write output)
+    inv_s = 1.0 / s
     for col_start in range(0, M, BM):
         cols = col_start + tl.arange(0, BM)
         mask = cols < M
         x = tl.load(X + row * M + cols, mask=mask, other=float("-inf"))
-        out = tl.exp(x - m) / s
+        out = tl.exp(x - m) * inv_s
         tl.store(OUT + row * M + cols, out, mask=mask)
 
 
 def flash_softmax(X: torch.Tensor) -> torch.Tensor:
     N, M = X.shape
     OUT = torch.empty_like(X)
+    # Use large block for better memory throughput
     BM = min(1024, triton.next_power_of_2(M))
     grid = (N,)
-    _flash_softmax_kernel[grid](X, OUT, M, BM)
+    _flash_softmax_kernel[grid](X, OUT, M, BM, num_warps=8)
     return OUT
 
 
