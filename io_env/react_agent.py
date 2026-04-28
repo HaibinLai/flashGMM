@@ -119,6 +119,11 @@ TOOLS = {
         },
         "example": '{"tool": "retrieve_pattern", "args": {"pattern": "gemm reduce"}}',
     },
+    "autotune_kernel": {
+        "description": "Automatically sweep block sizes and num_warps to find the optimal configuration for the current kernel. Tests all valid combinations of BLOCK_M, BK, num_warps and reports the best speedup. Use AFTER you have a correct kernel to find the best configuration.",
+        "parameters": {},
+        "example": '{"tool": "autotune_kernel", "args": {}}',
+    },
 }
 
 
@@ -292,6 +297,8 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
             return self._tool_profile_kernel(args)
         elif tool == "retrieve_pattern":
             return self._tool_retrieve_pattern(args)
+        elif tool == "autotune_kernel":
+            return self._tool_autotune_kernel(args)
         elif tool == "done":
             return self._tool_done()
         else:
@@ -634,6 +641,87 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
             lines.append("")
 
         return "\n".join(lines), 1.0, False
+
+    def _tool_autotune_kernel(self, args: dict) -> tuple[str, float, bool]:
+        """Auto-sweep block sizes and num_warps for the current kernel."""
+        import torch
+        from io_env.triton_codegen import generate_kernel, compile_and_test, benchmark_kernel
+
+        filepath = getattr(self, '_kernel_path', None)
+        if not filepath or not os.path.exists(filepath):
+            return "No kernel to autotune. Run generate_kernel first.", 0.0, False
+
+        with open(filepath) as f:
+            code = f.read()
+
+        p = self.params
+        results = []
+        best_speedup = 0.0
+        best_config = ""
+        best_code = code
+
+        # Detect tunable parameters in the kernel wrapper function
+        # Look for default values like BLOCK_M=64, BK=64, num_warps=8
+        import re
+
+        # Try to find the launcher function and its defaults
+        block_sizes = [32, 64, 128]
+        bk_sizes = [32, 64, 128]
+        warp_counts = [4, 8]
+
+        lines = [f"=== Autotune: {self.task_name} ==="]
+        lines.append(f"Sweeping BLOCK_M × BK × num_warps")
+        lines.append(f"{'BLOCK_M':>8s} {'BK':>4s} {'warps':>5s} | {'Speedup':>8s} | {'Status':>8s}")
+        lines.append("-" * 45)
+
+        for bm in block_sizes:
+            for bk in bk_sizes:
+                for nw in warp_counts:
+                    # Substitute parameters in the launcher
+                    variant = code
+                    # Replace default BLOCK_M, BK, num_warps values
+                    variant = re.sub(r'BLOCK_M\s*=\s*\d+', f'BLOCK_M={bm}', variant)
+                    variant = re.sub(r'block_m\s*=\s*\d+', f'block_m={bm}', variant)
+                    variant = re.sub(r'BK\s*=\s*\d+', f'BK={bk}', variant)
+                    variant = re.sub(r'bk\s*=\s*\d+', f'bk={bk}', variant)
+                    variant = re.sub(r'num_warps\s*=\s*\d+', f'num_warps={nw}', variant)
+
+                    _, vpath = generate_kernel(self.task_name, variant)
+                    try:
+                        test = compile_and_test(self.task_name, p, vpath)
+                        if "PASS" not in test:
+                            lines.append(f"{bm:8d} {bk:4d} {nw:5d} | {'FAIL':>8s} | compile")
+                            continue
+                        bench = benchmark_kernel(self.task_name, p, vpath)
+                        spd = 1.0
+                        for bl in bench.split("\n"):
+                            if "Speedup:" in bl:
+                                try:
+                                    spd = float(bl.split(":")[-1].strip().rstrip("×"))
+                                except ValueError:
+                                    pass
+                        lines.append(f"{bm:8d} {bk:4d} {nw:5d} | {spd:7.2f}× | {'PASS':>8s}")
+                        if spd > best_speedup:
+                            best_speedup = spd
+                            best_config = f"BLOCK_M={bm}, BK={bk}, num_warps={nw}"
+                            best_code = variant
+                    except Exception as e:
+                        lines.append(f"{bm:8d} {bk:4d} {nw:5d} | {'ERROR':>8s} | {str(e)[:20]}")
+                    torch.cuda.empty_cache()
+
+        lines.append("")
+        lines.append(f"Best config: {best_config}")
+        lines.append(f"Best speedup: {best_speedup:.2f}×")
+
+        # Save the best variant as the current kernel
+        if best_speedup > 0:
+            _, best_path = generate_kernel(self.task_name, best_code)
+            self._kernel_path = best_path
+            lines.append(f"Saved best kernel to: {best_path}")
+
+        obs = "\n".join(lines)
+        reward = 3.0 * (best_speedup - 1.0) if best_speedup > 1.0 else 0.0
+        return obs, reward, False
 
     def _tool_done(self) -> tuple[str, float, bool]:
         reward = compute_reward(self.baseline_report, self.current_report)

@@ -264,8 +264,8 @@ def run_llm_react_agent(task: str, model: str = "gpt-5.2",
                          "Step 3: Write an improved kernel with generate_kernel(custom_code=...). "
                          "DO NOT call 'done' until speedup >= 1.0× or you've exhausted optimization options.")
             else:
-                nudge = ("Kernel achieves speedup! Reflect on the results. "
-                         "Call 'done' with your final analysis including IO reduction + kernel speedup.")
+                nudge = ("Kernel achieves speedup! You can call 'autotune_kernel' to sweep block sizes "
+                         "for even better performance, or call 'done' with your final analysis.")
         elif tool == "benchmark":
             nudge = ("That was the Python-level benchmark. Now generate the REAL Triton kernel: "
                      "call 'generate_kernel', then 'compile_and_test', then 'benchmark_kernel'.")
