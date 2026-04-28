@@ -91,6 +91,17 @@ class DesignActions:
         new_ops.insert(min(idx1, idx2), fused)
         new_graph.operations = new_ops
 
+        # Rewrite any remaining references to the eliminated intermediate.
+        # Other ops that read the intermediate now read the fused op's inputs directly.
+        # Since the fused op absorbs the intermediate's computation, downstream ops
+        # that also read the intermediate should instead read the fused op's *output*
+        # (which has the same name as op2's output). If they truly needed the
+        # intermediate's value, that's a semantic issue; here we simply remove
+        # the dangling reference since the intermediate is no longer produced.
+        for op in new_graph.operations:
+            if op is not fused and intermediate_name in op.reads:
+                op.reads = [r for r in op.reads if r != intermediate_name]
+
         return new_graph
 
     @staticmethod

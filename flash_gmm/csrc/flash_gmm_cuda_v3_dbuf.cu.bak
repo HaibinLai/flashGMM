@@ -1,20 +1,25 @@
 /*
- * Flash-GMM: CUDA GPU Kernels (Optimized v2)
+ * Flash-GMM: CUDA GPU Kernels (Optimized v3)
  *
  * Optimizations:
  *   1. Pre-computed inv_var and log_coeff — no logf() in hot kernels
  *   2. Warp-collaborative distance — coalesced memory access via lane-striped dims
  *   3. Per-warp accumulators (Kernel 2) — eliminates all shared memory atomicAdd
- *   4. Online log-sum-exp state in shared memory
+ *   4. Double-buffered cp.async prefetch (Kernel 1) — overlaps centroid tile
+ *      load with distance computation on previous tile
  *
- * Note: Double-buffered cp.async was tested (v3) but degraded performance by ~13%
- * because centroid tiles are small enough to fit in L2 cache, and the extra shared
- * memory usage halves occupancy. Reverted to single-buffer approach.
+ * Kernel 1 (flash_log_normalizer_v3): Pass 1 — online log-sum-exp → log_normalizer[N]
+ *   Uses 2 shared memory buffers; while computing on buf[cur], cp.async prefetches
+ *   next tile into buf[nxt]. Uses float4 (16-byte) async copies for bandwidth.
+ *
+ * Kernel 2 (flash_accumulate_stats_v2): Pass 2 — recompute γ, accumulate n_k, s_k, sq_k
+ *   Single centroid tile per block (via grid.y) — no double-buffering needed.
  */
 
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_pipeline_primitives.h>
 #include <float.h>
 #include <algorithm>
 
@@ -57,20 +62,28 @@ __global__ void precompute_params_kernel(
 }
 
 // ============================================================================
-// Kernel 1 v2: Flash Log-Normalizer
+// Kernel 1 v3: Flash Log-Normalizer with Double-Buffered cp.async Prefetch
 //
 // Grid:  ceil(N / BN)
 // Block: BLOCK_THREADS (256 = 8 warps)
 //
-// Each warp collaboratively handles one point at a time:
-//   - 32 lanes handle different dimensions (coalesced X reads)
-//   - Warp-reduce for full Mahalanobis distance
+// Double buffer layout in shared memory:
+//   buf[0]: mu[BK*d] + iv[BK*d] + lc[BK]
+//   buf[1]: mu[BK*d] + iv[BK*d] + lc[BK]
+//   max_smem[BN]  — running log-sum-exp max per point
+//   sum_smem[BN]  — running log-sum-exp sum per point
 //
-// Shared memory: mu_tile[BK*d] + iv_tile[BK*d] + lc_tile[BK] + max[BN] + sum[BN]
+// Pipeline:
+//   Prologue: cp.async tile[0] → buf[0], commit, wait, sync
+//   Loop t=0..n_tiles-1:
+//     1. cp.async tile[t+1] → buf[nxt], commit    (overlaps with compute)
+//     2. Compute distances on buf[cur]
+//     3. __pipeline_wait_prior(0) + __syncthreads()
+//     4. swap cur ↔ nxt
 // ============================================================================
 
 template <int BK_COMPILE>
-__global__ void flash_log_normalizer_v2_kernel(
+__global__ void flash_log_normalizer_v3_kernel(
     const float* __restrict__ X,
     const float* __restrict__ mu,
     const float* __restrict__ inv_var,
@@ -79,10 +92,17 @@ __global__ void flash_log_normalizer_v2_kernel(
     int N, int K, int d, int BN
 ) {
     extern __shared__ float smem[];
-    float* mu_tile  = smem;
-    float* iv_tile  = mu_tile + BK_COMPILE * d;
-    float* lc_tile  = iv_tile + BK_COMPILE * d;
-    float* max_smem = lc_tile + BK_COMPILE;
+
+    // Double buffer geometry
+    const int tile_floats = BK_COMPILE * d;          // mu or iv size per buffer
+    const int buf_stride  = 2 * tile_floats + BK_COMPILE;  // total floats per buffer
+
+    // Shared memory pointers
+    // buf[b] = smem + b * buf_stride
+    //   mu:  offset 0
+    //   iv:  offset tile_floats
+    //   lc:  offset 2 * tile_floats
+    float* max_smem = smem + 2 * buf_stride;
     float* sum_smem = max_smem + BN;
 
     const int tid = threadIdx.x;
@@ -91,40 +111,92 @@ __global__ void flash_log_normalizer_v2_kernel(
     const int n_warps = blockDim.x >> 5;
     const int block_start = blockIdx.x * BN;
     const int BN_actual = min(BN, N - block_start);
+    const int n_tiles = (K + BK_COMPILE - 1) / BK_COMPILE;
 
     // Initialize logsumexp state
     for (int i = tid; i < BN_actual; i += blockDim.x) {
         max_smem[i] = -FLT_MAX;
         sum_smem[i] = 0.0f;
     }
+
+    // ---- Prologue: async prefetch tile[0] into buf[0] ----
+    {
+        int tile_k = min(BK_COMPILE, K);
+        int n_f4 = (tile_k * d) >> 2;   // d is always multiple of 4
+
+        float* mu_dst = smem;                     // buf[0] mu
+        float* iv_dst = smem + tile_floats;       // buf[0] iv
+        float* lc_dst = smem + 2 * tile_floats;   // buf[0] lc
+
+        for (int i = tid; i < n_f4; i += blockDim.x) {
+            __pipeline_memcpy_async(
+                reinterpret_cast<float4*>(mu_dst) + i,
+                reinterpret_cast<const float4*>(mu) + i,
+                16);
+            __pipeline_memcpy_async(
+                reinterpret_cast<float4*>(iv_dst) + i,
+                reinterpret_cast<const float4*>(inv_var) + i,
+                16);
+        }
+        for (int i = tid; i < tile_k; i += blockDim.x) {
+            __pipeline_memcpy_async(&lc_dst[i], &log_coeff[i], 4);
+        }
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+    }
     __syncthreads();
 
-    // Stream centroid tiles
-    for (int t = 0; t < K; t += BK_COMPILE) {
+    // ---- Main loop: double-buffered tile streaming ----
+    int cur_off = 0;
+    int nxt_off = buf_stride;
+
+    for (int tile = 0; tile < n_tiles; tile++) {
+        int t = tile * BK_COMPILE;
         int tile_k = min(BK_COMPILE, K - t);
 
-        // Cooperative load of centroid tile
-        __syncthreads();
-        for (int idx = tid; idx < tile_k * d; idx += blockDim.x) {
-            int kk = idx / d, jj = idx % d;
-            mu_tile[kk * d + jj] = mu[(t + kk) * d + jj];
-            iv_tile[kk * d + jj] = inv_var[(t + kk) * d + jj];
-        }
-        for (int idx = tid; idx < tile_k; idx += blockDim.x) {
-            lc_tile[idx] = log_coeff[t + idx];
-        }
-        __syncthreads();
+        // ---- 1. Async prefetch next tile into buf[nxt] ----
+        int next_t = t + BK_COMPILE;
+        bool has_next = (next_t < K);
+        if (has_next) {
+            int next_tile_k = min(BK_COMPILE, K - next_t);
+            int n_f4 = (next_tile_k * d) >> 2;
 
-        // Each warp processes its subset of points
+            float* mu_nxt = smem + nxt_off;
+            float* iv_nxt = smem + nxt_off + tile_floats;
+            float* lc_nxt = smem + nxt_off + 2 * tile_floats;
+
+            for (int i = tid; i < n_f4; i += blockDim.x) {
+                __pipeline_memcpy_async(
+                    reinterpret_cast<float4*>(mu_nxt) + i,
+                    reinterpret_cast<const float4*>(&mu[next_t * d]) + i,
+                    16);
+                __pipeline_memcpy_async(
+                    reinterpret_cast<float4*>(iv_nxt) + i,
+                    reinterpret_cast<const float4*>(&inv_var[next_t * d]) + i,
+                    16);
+            }
+            for (int i = tid; i < next_tile_k; i += blockDim.x) {
+                __pipeline_memcpy_async(&lc_nxt[i], &log_coeff[next_t + i], 4);
+            }
+            __pipeline_commit();
+        }
+
+        // ---- 2. Compute on buf[cur] ----
+        float* mu_tile = smem + cur_off;
+        float* iv_tile = smem + cur_off + tile_floats;
+        float* lc_tile = smem + cur_off + 2 * tile_floats;
+
         for (int pt = warp_id; pt < BN_actual; pt += n_warps) {
             int n = block_start + pt;
 
+            // Load logsumexp state
             float rm = __shfl_sync(0xffffffff,
                            (lane_id == 0) ? max_smem[pt] : 0.0f, 0);
             float rs = __shfl_sync(0xffffffff,
                            (lane_id == 0) ? sum_smem[pt] : 0.0f, 0);
 
             for (int kk = 0; kk < tile_k; kk++) {
+                // Warp-collaborative Mahalanobis distance
                 float partial = 0.0f;
                 #pragma unroll
                 for (int i = 0; i < MAX_DIMS_PER_LANE; i++) {
@@ -139,6 +211,7 @@ __global__ void flash_log_normalizer_v2_kernel(
 
                 float ll = lc_tile[kk] - 0.5f * mahal;
 
+                // Online log-sum-exp
                 if (ll > rm) {
                     rs = rs * __expf(rm - ll) + 1.0f;
                     rm = ll;
@@ -152,17 +225,27 @@ __global__ void flash_log_normalizer_v2_kernel(
                 sum_smem[pt] = rs;
             }
         }
+
+        // ---- 3. Wait for async prefetch, synchronize ----
+        if (has_next) {
+            __pipeline_wait_prior(0);
+        }
+        __syncthreads();
+
+        // ---- 4. Swap buffers ----
+        int tmp = cur_off;
+        cur_off = nxt_off;
+        nxt_off = tmp;
     }
 
-    __syncthreads();
-
+    // Write log_normalizer to global memory
     for (int pt = tid; pt < BN_actual; pt += blockDim.x) {
         log_normalizer[block_start + pt] = max_smem[pt] + logf(sum_smem[pt]);
     }
 }
 
 // ============================================================================
-// Kernel 2 v2: Flash Accumulate Statistics
+// Kernel 2 v2: Flash Accumulate Statistics (Pass 2 of fused E+M)
 //
 // Single centroid tile per block (grid.y splits K) → no double-buffering needed.
 // Per-warp accumulators → zero atomics in hot loop.
@@ -190,6 +273,7 @@ __global__ void flash_accumulate_stats_v2_kernel(
     const int tile_k = min(BK_COMPILE, K - k_start);
     const int BN_actual = min(BN, N - block_start);
 
+    // Shared memory layout
     float* mu_tile  = smem;
     float* iv_tile  = mu_tile  + BK_COMPILE * d;
     float* lc_tile  = iv_tile  + BK_COMPILE * d;
@@ -197,6 +281,7 @@ __global__ void flash_accumulate_stats_v2_kernel(
     float* warp_sk  = warp_nk  + n_warps * BK_COMPILE;
     float* warp_sqk = warp_sk  + n_warps * BK_COMPILE * d;
 
+    // Load centroid tile
     for (int idx = tid; idx < tile_k * d; idx += blockDim.x) {
         int kk = idx / d, jj = idx % d;
         mu_tile[kk * d + jj] = mu[(k_start + kk) * d + jj];
@@ -206,6 +291,7 @@ __global__ void flash_accumulate_stats_v2_kernel(
         lc_tile[idx] = log_coeff[k_start + idx];
     }
 
+    // Zero per-warp accumulators
     for (int idx = tid; idx < n_warps * BK_COMPILE; idx += blockDim.x)
         warp_nk[idx] = 0.0f;
     for (int idx = tid; idx < n_warps * BK_COMPILE * d; idx += blockDim.x) {
@@ -214,10 +300,12 @@ __global__ void flash_accumulate_stats_v2_kernel(
     }
     __syncthreads();
 
+    // ---- Main loop: process points ----
     for (int pt = warp_id; pt < BN_actual; pt += n_warps) {
         int n = block_start + pt;
         float ln_val = log_normalizer[n];
 
+        // Load X dims (lane-striped, coalesced within warp)
         float x_local[MAX_DIMS_PER_LANE];
         #pragma unroll
         for (int i = 0; i < MAX_DIMS_PER_LANE; i++) {
@@ -226,6 +314,7 @@ __global__ void flash_accumulate_stats_v2_kernel(
         }
 
         for (int kk = 0; kk < tile_k; kk++) {
+            // Warp-collaborative Mahalanobis distance
             float partial = 0.0f;
             #pragma unroll
             for (int i = 0; i < MAX_DIMS_PER_LANE; i++) {
@@ -241,6 +330,7 @@ __global__ void flash_accumulate_stats_v2_kernel(
             float ll = lc_tile[kk] - 0.5f * mahal;
             float gamma_nk = __expf(ll - ln_val);
 
+            // Accumulate to per-warp storage (NO conflicts)
             if (lane_id == 0)
                 warp_nk[warp_id * BK_COMPILE + kk] += gamma_nk;
 
@@ -258,6 +348,7 @@ __global__ void flash_accumulate_stats_v2_kernel(
 
     __syncthreads();
 
+    // ---- Inter-warp tree reduction ----
     for (int stride = n_warps >> 1; stride > 0; stride >>= 1) {
         if (warp_id < stride) {
             for (int idx = lane_id; idx < tile_k; idx += 32)
@@ -273,6 +364,7 @@ __global__ void flash_accumulate_stats_v2_kernel(
         __syncthreads();
     }
 
+    // ---- Warp 0 → global ----
     if (warp_id == 0) {
         for (int idx = lane_id; idx < tile_k; idx += 32)
             atomicAdd(&global_n_k[k_start + idx], warp_nk[idx]);
@@ -284,7 +376,7 @@ __global__ void flash_accumulate_stats_v2_kernel(
 }
 
 // ============================================================================
-// Kernel 3: Update parameters
+// Kernel 3: Update parameters from sufficient statistics
 // ============================================================================
 
 __global__ void update_params_kernel(
@@ -314,7 +406,7 @@ __global__ void update_params_kernel(
 }
 
 // ============================================================================
-// Standard E-step baseline
+// Standard E-step baseline (materializes full L ∈ R^{N×K})
 // ============================================================================
 
 __global__ void standard_e_step_kernel(
@@ -366,7 +458,7 @@ __global__ void logsumexp_normalize_kernel(
 }
 
 // ============================================================================
-// ATen Launchers
+// ATen Launcher Functions
 // ============================================================================
 
 std::vector<torch::Tensor> standard_e_step_cuda(
@@ -407,7 +499,7 @@ std::vector<torch::Tensor> flash_em_fused_cuda(
     auto inv_var  = torch::empty({K, d}, X.options());
     auto lcoeff   = torch::empty({K}, X.options());
 
-    // ---- Kernel 0: Pre-compute ----
+    // ---- Kernel 0: Pre-compute inv_var and log_coeff ----
     {
         int threads_pc = std::min(K, 256);
         int blocks_pc = (K + threads_pc - 1) / threads_pc;
@@ -419,6 +511,7 @@ std::vector<torch::Tensor> flash_em_fused_cuda(
 
     const int n_warps = BLOCK_THREADS / 32;
 
+    // ---- Auto-select BK ----
     int BK1 = std::min(32, K);
     if (BK1 >= 32) BK1 = 32;
     else if (BK1 >= 16) BK1 = 16;
@@ -438,16 +531,17 @@ std::vector<torch::Tensor> flash_em_fused_cuda(
         BK2 = std::min(BK2, K);
     }
 
-    // ---- Pass 1: log_normalizer ----
+    // ---- Pass 1: Compute log_normalizer (double-buffered cp.async) ----
     {
         int grid_n = (N + BN - 1) / BN;
-        size_t smem_pass1 = (size_t)(BK1 * (2 * d + 1) + 2 * BN) * sizeof(float);
+        // Double buffer: 2 × BK1*(2d+1)  +  2*BN for logsumexp state
+        size_t smem_pass1 = (size_t)(2 * BK1 * (2 * d + 1) + 2 * BN) * sizeof(float);
 
         #define LAUNCH_K1(BK_VAL)                                                              \
             cudaFuncSetAttribute(                                                               \
-                flash_log_normalizer_v2_kernel<BK_VAL>,                                         \
+                flash_log_normalizer_v3_kernel<BK_VAL>,                                         \
                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_pass1);                   \
-            flash_log_normalizer_v2_kernel<BK_VAL><<<grid_n, BLOCK_THREADS, smem_pass1>>>(      \
+            flash_log_normalizer_v3_kernel<BK_VAL><<<grid_n, BLOCK_THREADS, smem_pass1>>>(      \
                 X.data_ptr<float>(), mu.data_ptr<float>(),                                      \
                 inv_var.data_ptr<float>(), lcoeff.data_ptr<float>(),                             \
                 log_normalizer.data_ptr<float>(), N, K, d, BN);
@@ -460,7 +554,7 @@ std::vector<torch::Tensor> flash_em_fused_cuda(
         #undef LAUNCH_K1
     }
 
-    // ---- Pass 2: sufficient statistics ----
+    // ---- Pass 2: Accumulate sufficient statistics (unchanged) ----
     {
         dim3 grid((N + BN - 1) / BN, (K + BK2 - 1) / BK2);
         size_t smem_pass2 = (size_t)BK2 * (2 * d + 1) * (1 + n_warps) * sizeof(float);
@@ -484,7 +578,7 @@ std::vector<torch::Tensor> flash_em_fused_cuda(
         #undef LAUNCH_K2
     }
 
-    // ---- Update parameters ----
+    // ---- Compute new parameters ----
     {
         update_params_kernel<<<K, std::min(d, 256)>>>(
             n_k.data_ptr<float>(), s_k.data_ptr<float>(), sq_k.data_ptr<float>(),
