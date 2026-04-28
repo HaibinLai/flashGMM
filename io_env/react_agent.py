@@ -82,6 +82,14 @@ TOOLS = {
         "parameters": {},
         "example": '{"tool": "done", "args": {}}',
     },
+    "benchmark": {
+        "description": "Run actual GPU benchmark for the current operator. Compares baseline (materialized) vs optimized (flash) implementations using real PyTorch/CUDA execution. Returns wall-clock times and actual speedup.",
+        "parameters": {
+            "n_warmup": "int (optional, default 5) — warmup iterations",
+            "n_iter": "int (optional, default 20) — benchmark iterations",
+        },
+        "example": '{"tool": "benchmark", "args": {}}',
+    },
 }
 
 
@@ -210,6 +218,8 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
             return self._tool_undo()
         elif tool == "verify":
             return self._tool_verify()
+        elif tool == "benchmark":
+            return self._tool_benchmark(args)
         elif tool == "done":
             return self._tool_done()
         else:
@@ -320,6 +330,92 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
         obs = header + "\n" + "\n".join(results)
         return obs, reward if passed == total else 0.0, False
 
+    def _tool_benchmark(self, args: dict) -> tuple[str, float, bool]:
+        """Run actual GPU benchmark comparing baseline vs optimized."""
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return "Benchmark skipped: no GPU available.", 0.0, False
+        except ImportError:
+            return "Benchmark skipped: torch not available.", 0.0, False
+
+        n_warmup = args.get("n_warmup", 5)
+        n_iter = args.get("n_iter", 20)
+        p = self.params
+
+        benchmarks = _BENCHMARKS.get(self.task_name)
+        if not benchmarks:
+            return (f"Benchmark not implemented for '{self.task_name}'. "
+                    f"Available: {list(_BENCHMARKS.keys())}"), 0.0, False
+
+        baseline_fn, flash_fn, setup_fn = benchmarks["baseline"], benchmarks["flash"], benchmarks["setup"]
+
+        try:
+            tensors = setup_fn(p)
+
+            # Warmup
+            for _ in range(n_warmup):
+                baseline_fn(tensors)
+                flash_fn(tensors)
+            torch.cuda.synchronize()
+
+            # Benchmark baseline
+            s = torch.cuda.Event(enable_timing=True)
+            e = torch.cuda.Event(enable_timing=True)
+            s.record()
+            for _ in range(n_iter):
+                baseline_fn(tensors)
+            e.record()
+            torch.cuda.synchronize()
+            t_baseline = s.elapsed_time(e) / n_iter
+
+            # Benchmark flash
+            s.record()
+            for _ in range(n_iter):
+                flash_fn(tensors)
+            e.record()
+            torch.cuda.synchronize()
+            t_flash = s.elapsed_time(e) / n_iter
+
+            speedup = t_baseline / t_flash if t_flash > 0 else 0
+            roofline_speedup = self.baseline_report.estimated_time_ms / max(self.current_report.estimated_time_ms, 1e-9)
+
+            lines = [
+                f"GPU Benchmark: {self.task_name} ({torch.cuda.get_device_name()})",
+                f"  Params: { {k:v for k,v in p.items() if isinstance(v, int)} }",
+                f"  Baseline (materialized):  {t_baseline:.3f} ms",
+                f"  Flash (optimized):        {t_flash:.3f} ms",
+                f"  Actual speedup:           {speedup:.2f}×",
+                f"  Roofline predicted:       {roofline_speedup:.2f}×",
+                f"  Prediction accuracy:      {min(speedup/roofline_speedup, roofline_speedup/speedup)*100:.0f}%",
+            ]
+
+            if speedup > 1.05:
+                lines.append(f"  ✓ Flash is {speedup:.2f}× faster!")
+            elif speedup > 0.95:
+                lines.append(f"  ~ Performance similar (within 5%)")
+            else:
+                lines.append(f"  ⚠ Flash is slower ({speedup:.2f}×) — may need kernel-level optimization")
+
+            obs = "\n".join(lines)
+            reward = 2.0 * (speedup - 1.0)  # bonus for actual speedup
+            return obs, max(reward, 0.0), False
+
+        except Exception as ex:
+            return f"Benchmark error: {ex}", 0.0, False
+        finally:
+            # Cleanup GPU memory
+            try:
+                import torch
+                if 'tensors' in locals():
+                    for v in tensors.values():
+                        if hasattr(v, 'device') and str(v.device).startswith('cuda'):
+                            del v
+                    del tensors
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
     def _tool_done(self) -> tuple[str, float, bool]:
         reward = compute_reward(self.baseline_report, self.current_report)
         obs = self._make_summary()
@@ -407,6 +503,135 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
             observation=obs,
             reward=reward,
         ))
+
+
+# ============================================================================
+# Benchmark implementations for each operator
+# Each entry has: setup(params) -> tensors, baseline(tensors), flash(tensors)
+# ============================================================================
+
+def _make_benchmarks():
+    """Create benchmark functions. Deferred to avoid importing torch at module load."""
+    benchmarks = {}
+
+    try:
+        import torch
+        import torch.nn.functional as F
+    except ImportError:
+        return benchmarks
+
+    # ---- Cross-Entropy ----
+    def ce_setup(p):
+        N, V = p["N"], p["V"]
+        torch.manual_seed(42)
+        logits = torch.randn(N, V, device="cuda")
+        labels = torch.randint(0, V, (N,), device="cuda")
+        return {"logits": logits, "labels": labels, "N": N, "V": V}
+
+    def ce_baseline(t):
+        # Standard: materialize exp, sum, log separately
+        logits, labels = t["logits"], t["labels"]
+        max_vals = logits.max(dim=1, keepdim=True).values
+        exp_logits = (logits - max_vals).exp()
+        log_sum_exp = exp_logits.sum(dim=1).log()
+        gathered = logits.gather(1, labels.unsqueeze(1)).squeeze(1)
+        loss = -(gathered - max_vals.squeeze(1) - log_sum_exp)
+        return loss
+
+    def ce_flash(t):
+        # PyTorch fused cross_entropy (single kernel, no materialization)
+        return F.cross_entropy(t["logits"], t["labels"], reduction="none")
+
+    benchmarks["cross_entropy"] = {"setup": ce_setup, "baseline": ce_baseline, "flash": ce_flash}
+
+    # ---- GMM E-step ----
+    def gmm_setup(p):
+        N, K, d = p["N"], p["K"], p["d"]
+        torch.manual_seed(42)
+        X = torch.randn(N, d, device="cuda")
+        mu = torch.randn(K, d, device="cuda")
+        var = torch.ones(K, d, device="cuda") * 1.0
+        log_pi = torch.full((K,), -torch.log(torch.tensor(float(K))), device="cuda")
+        return {"X": X, "mu": mu, "var": var, "log_pi": log_pi}
+
+    def gmm_baseline(t):
+        # Materialize full L matrix
+        X, mu, var, log_pi = t["X"], t["mu"], t["var"], t["log_pi"]
+        d = X.shape[1]
+        log_det = var.log().sum(1)
+        diff = X.unsqueeze(1) - mu.unsqueeze(0)
+        mahal = (diff ** 2 / var.unsqueeze(0)).sum(2)
+        L = log_pi.unsqueeze(0) - 0.5 * (d * 1.8379 + log_det.unsqueeze(0) + mahal)
+        log_norm = torch.logsumexp(L, dim=1)
+        return log_norm
+
+    def gmm_flash(t):
+        # Try native kernel first, fall back to same code (demonstrates IO savings concept)
+        try:
+            import flash_gmm_native as _C
+            _, _, _, log_norm = _C.flash_em_fused(t["X"], t["mu"], t["var"], t["log_pi"], 128, 32)
+            return log_norm
+        except ImportError:
+            return gmm_baseline(t)  # fallback
+
+    benchmarks["gmm_estep"] = {"setup": gmm_setup, "baseline": gmm_baseline, "flash": gmm_flash}
+
+    # ---- KMeans ----
+    def km_setup(p):
+        N, K, d = p["N"], p["K"], p["d"]
+        torch.manual_seed(42)
+        X = torch.randn(N, d, device="cuda")
+        C = torch.randn(K, d, device="cuda")
+        return {"X": X, "C": C}
+
+    def km_baseline(t):
+        # Materialize N×K distance matrix
+        X, C = t["X"], t["C"]
+        D = torch.cdist(X, C, p=2.0)  # (N, K) materialized
+        return D.argmin(dim=1)
+
+    def km_flash(t):
+        # Chunked argmin without full D materialization
+        X, C = t["X"], t["C"]
+        K = C.shape[0]
+        BK = 32
+        best_dist = torch.full((X.shape[0],), float('inf'), device=X.device)
+        best_idx = torch.zeros(X.shape[0], dtype=torch.long, device=X.device)
+        for k_start in range(0, K, BK):
+            k_end = min(k_start + BK, K)
+            D_tile = torch.cdist(X, C[k_start:k_end], p=2.0)
+            tile_min, tile_idx = D_tile.min(dim=1)
+            better = tile_min < best_dist
+            best_dist[better] = tile_min[better]
+            best_idx[better] = tile_idx[better] + k_start
+        return best_idx
+
+    benchmarks["kmeans"] = {"setup": km_setup, "baseline": km_baseline, "flash": km_flash}
+
+    # ---- Softmax ----
+    def sm_setup(p):
+        N, d = p["N"], p["d"]
+        torch.manual_seed(42)
+        Q = torch.randn(N, d, device="cuda")
+        K_mat = torch.randn(N, d, device="cuda")
+        return {"Q": Q, "K": K_mat}
+
+    def sm_baseline(t):
+        # Materialize S = QK^T then softmax
+        S = t["Q"] @ t["K"].T  # (N, N) materialized
+        return torch.softmax(S, dim=1)
+
+    def sm_flash(t):
+        # PyTorch scaled_dot_product_attention uses FlashAttention internally
+        Q, K = t["Q"].unsqueeze(0).unsqueeze(0), t["K"].unsqueeze(0).unsqueeze(0)
+        out = F.scaled_dot_product_attention(Q, K, K, is_causal=False)
+        return out.squeeze(0).squeeze(0)
+
+    benchmarks["softmax"] = {"setup": sm_setup, "baseline": sm_baseline, "flash": sm_flash}
+
+    return benchmarks
+
+_BENCHMARKS = _make_benchmarks()
 
 
 # ============================================================================
