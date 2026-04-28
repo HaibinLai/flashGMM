@@ -187,17 +187,25 @@ intermediate matrix materialization, using techniques like:
 ## Available Tools
 {tool_desc}
 
-## Strategy
-1. First, use 'analyze' to understand the baseline operator's IO bottlenecks
+## Required Workflow (MUST follow this order)
+1. Use 'analyze' to understand the baseline operator's IO bottlenecks
 2. Identify materialized intermediates (tensors written to HBM then read back)
 3. Apply optimizations to eliminate them (prefer fuse_and_online for large intermediates)
 4. Use 'verify' to check the optimization is valid
-5. Call 'done' when no more materialized intermediates remain
+5. Use 'benchmark' to measure ACTUAL GPU speedup — this is critical!
+6. REFLECT on the benchmark results:
+   - If actual speedup < roofline prediction, explain WHY (cache effects? kernel launch overhead? Python loop overhead?)
+   - If actual speedup > 1, confirm the IO optimization translates to real performance gain
+   - If actual speedup < 1, consider whether the optimization is still valuable (VRAM savings? larger scale?)
+7. Call 'done' with a final summary that includes both symbolic analysis AND benchmark results
 
 ## Response Format
 For each step, respond with:
 Thought: <your reasoning about what to do and why>
 Action: {{"tool": "<tool_name>", "args": {{...}}}}
+
+IMPORTANT: You MUST call 'benchmark' before 'done'. After seeing benchmark results,
+reflect on why actual speedup differs from roofline prediction.
 """
         return prompt
 

@@ -183,53 +183,64 @@ C++ OpenMP 的并行效率远超 PyTorch MKL（8 核接近线性加速）。
 
 ## 7. GPU 性能结果 (benchmark_gpu.py)
 
-### A100 80GB, CUDA 13.1, 全部 VRAM 可用
+### A100 80GB, CUDA 13.1, 优化 v2 kernel
 
-| N | K | d | Standard | Flash E+M | 速度比 | 正确性 |
-|---:|---:|---:|---:|---:|---:|---|
-| 4096 | 8 | 32 | 0.18 ms | 1.73 ms | 0.11× | PASS |
-| 4096 | 16 | 32 | 0.23 ms | 1.77 ms | 0.13× | PASS |
-| 16384 | 16 | 64 | 0.34 ms | 3.13 ms | 0.11× | PASS |
-| 16384 | 64 | 64 | 1.04 ms | 4.89 ms | 0.21× | PASS |
-| 16384 | 128 | 64 | 1.99 ms | 10.49 ms | 0.19× | PASS |
-| 65536 | 64 | 128 | 5.45 ms | 39.24 ms | 0.14× | PASS |
-| 65536 | 256 | 128 | 21.66 ms | 139.09 ms | 0.16× | PASS |
-| 65536 | 512 | 128 | 42.49 ms | 276.88 ms | 0.15× | PASS |
-| 262144 | 64 | 64 | 9.44 ms | 68.95 ms | 0.14× | PASS |
-| 262144 | 128 | 64 | 18.64 ms | 136.70 ms | 0.14× | PASS |
-| 32768 | 1024 | 64 | 30.00 ms | 144.55 ms | 0.21× | PASS |
-| 65536 | 1024 | 64 | 45.55 ms | 273.05 ms | 0.17× | PASS |
+CUDA kernel 优化措施：
+- 预计算 `inv_var` 和 `log_coeff` — 热循环中零 `logf()` 调用
+- Warp 协作 Mahalanobis 距离 — 32 lane 处理不同维度，coalesced 访存
+- Per-warp 累加器 — 热循环中零 shared memory atomicAdd
 
-**GPU 结论**: 当前 CUDA kernel 是**功能正确的参考实现 (proof-of-concept)**。  
-Standard baseline 走 ATen → cuBLAS GEMM → Tensor Core 极其高效；Flash kernel 手写 per-element 循环无法与之竞争。
+| N | K | d | Standard | Flash E+M | 速度比 | VRAM (标准) | VRAM (Flash) | VRAM 节省 | 正确性 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 4096 | 8 | 32 | 0.18 ms | 0.34 ms | 0.52× | 0.8 MB | 0.5 MB | — | PASS |
+| 4096 | 16 | 32 | 0.24 ms | 0.62 ms | 0.38× | 1.1 MB | 0.5 MB | — | PASS |
+| 16384 | 16 | 64 | 0.33 ms | 0.63 ms | 0.53× | 6.3 MB | 4.2 MB | 1.5× | PASS |
+| 16384 | 64 | 64 | 1.04 ms | 1.60 ms | 0.65× | 12.6 MB | 4.2 MB | 3.0× | PASS |
+| 16384 | 128 | 64 | 1.99 ms | 2.75 ms | 0.73× | 21.0 MB | 4.3 MB | 4.9× | PASS |
+| 65536 | 64 | 128 | 5.42 ms | 3.58 ms | **1.51×** | 67.2 MB | 33.6 MB | 2.0× | PASS |
+| 65536 | 256 | 128 | 21.65 ms | 13.84 ms | **1.56×** | 168.0 MB | 33.8 MB | 5.0× | PASS |
+| 65536 | 512 | 128 | 42.54 ms | 27.61 ms | **1.54×** | 302.5 MB | 34.1 MB | **8.9×** | PASS |
+| 262144 | 64 | 64 | 9.44 ms | 12.13 ms | 0.78× | 201.4 MB | 67.1 MB | 3.0× | PASS |
+| 262144 | 128 | 64 | 18.53 ms | 24.14 ms | 0.77× | 335.6 MB | 67.2 MB | 5.0× | PASS |
+| 32768 | 1024 | 64 | 30.01 ms | 30.61 ms | 0.98× | 277.3 MB | 8.9 MB | **31.2×** | PASS |
+| 65536 | 1024 | 64 | 45.41 ms | 51.67 ms | 0.88× | 554.2 MB | 17.3 MB | **32.0×** | PASS |
+
+**GPU 结论**:
+- **d=128 (IO-bound)**: Flash-GMM **比 Standard 快 1.5×** — IO 节省占主导，Flash 优势完全兑现
+- **d=64 (compute-bound)**: Standard 仍略快 — cuBLAS GEMM M-step 用 Tensor Core 极其高效
+- **VRAM 节省**: Flash 始终更省内存，最高 **32×** (K=1024, d=64)
+- 收敛测试: 20 轮迭代, 最终 LL diff = 0.00e+00
+
+### v1 → v2 优化提升
+
+| 配置 (N, K, d) | v1 速度比 | v2 速度比 | Kernel 提升 |
+|---|---|---|---|
+| 65536, 64, 128 | 0.14× | **1.51×** | **10.8×** |
+| 65536, 256, 128 | 0.16× | **1.56×** | **9.8×** |
+| 65536, 512, 128 | 0.15× | **1.54×** | **10.3×** |
+| 16384, 128, 64 | 0.19× | **0.73×** | **3.8×** |
+| 32768, 1024, 64 | 0.21× | **0.98×** | **4.7×** |
+
+### 双缓冲 cp.async 实验 (v3)
+
+实测 v3 双缓冲版本比 v2 **慢约 13%**，原因：
+- Centroid tile 小 (~32KB)，A100 L2 cache (40MB) 全部命中，load 延迟已被 cache 掩盖
+- 双缓冲 2× 共享内存 → occupancy 下降
+- `__pipeline_commit/wait` 同步开销 > 被隐藏的加载延迟
+
+结论：双缓冲更适合 full covariance ($O(Kd^2)$ 参数) 场景，diagonal covariance 不需要。
 
 ---
 
-## 8. GPU 性能差距根因分析
+## 8. 剩余 GPU 优化路径
 
-| 瓶颈 | 描述 | 量化影响 |
-|---|---|---|
-| **无 Tensor Core** | 手写 float 循环计算 $x_i^T \mu_k$，未利用 WMMA/MMA | 计算吞吐低 10-50× |
-| **Per-element atomicAdd** | Pass 2 中 γ×x 每元素一次 shared memory atomic | 严重竞争、序列化 |
-| **无 vectorized load** | 未用 float4/LDG.128 | 内存带宽利用率 < 25% |
-| **2× FLOPs** | 双 pass 重计算距离 | 纯计算开销翻倍 |
-| **Kernel launch overhead** | 小规模时 launch 开销主导 | 小 N/K 时尤为严重 |
-
-### 优化路径
+当前 d=64 regime 下 Flash 仍略慢于 Standard，进一步优化方向：
 
 1. **GEMM-based 距离**: $\|x-\mu\|^2/\sigma^2 = \|x/\sigma\|^2 + \|\mu/\sigma\|^2 - 2(x/\sigma)^T(\mu/\sigma)$  
    → 内积部分映射到 Tensor Core GEMM tile
 2. **Tile 内融合 online log-sum-exp**: 在 GEMM output tile 上直接做在线归约  
    → 类似 FlashAttention 在 $QK^T$ tile 上融合 softmax
-3. **Warp-level reduction**: `__shfl_xor_sync` 替代 shared memory atomicAdd
-4. **Vectorized memory access**: float4 加载 X 和 centroid 参数
-5. **Triton 重写**: Triton DSL 表达 tiling + 在线归约，自动生成优化 kernel
-
-### 预期收益
-
-在 $K \gg d$ 的 IO-bound regime 下，优化后的 Flash-GMM 应当：
-- 消除 cuBLAS 需要物化的 $N \times K$ 中间矩阵
-- 实现与 Flash-KMeans 类似的数量级加速（IO 节省 5-14× → 端到端预期 3-10×）
+3. **Triton 重写**: Triton DSL 表达 tiling + 在线归约，自动生成优化 kernel
 
 ---
 
@@ -288,7 +299,8 @@ LD_LIBRARY_PATH=$(python -c "import torch; print(torch.__path__[0])")/lib:$LD_LI
 │ ✅ IO 模型:    理论分析 + 实测 IO 计数一致, 最高 14.4× 节省      │
 │ ✅ VRAM 节省:  GPU 实测最高 32× (K=1024, d=64)                  │
 │ ✅ CPU 性能:   C++ OpenMP 8核比 PyTorch 快 2.3-5.6×             │
-│ ⚠️ GPU 性能:   参考实现, 需 Tensor Core / Triton 优化           │
-│ 🔲 下一步:     GEMM-based 距离 + tile 内融合 online log-sum-exp  │
+│ ✅ GPU 性能:   d=128 时 Flash 比 Standard 快 1.5× (v2 优化)     │
+│ ⚠️ GPU d=64:   Standard cuBLAS 仍略快, 需 Tensor Core GEMM     │
+│ 🔲 下一步:     GEMM-based 距离 + Triton 重写                    │
 └─────────────────────────────────────────────────────────────────┘
 ```

@@ -236,7 +236,16 @@ def run_llm_react_agent(task: str, model: str = "gpt-5.2",
 
         # Add to conversation
         messages.append({"role": "assistant", "content": response})
-        messages.append({"role": "user", "content": f"Observation:\n{obs}\nReward: {reward:+.2f}\n\nContinue optimizing or call 'done' if finished."})
+
+        # Contextual nudge based on what just happened
+        if tool == "verify" and "ALL PASSED" in obs:
+            nudge = "Verification passed. Now run 'benchmark' to measure actual GPU speedup, then reflect on the results."
+        elif tool == "benchmark":
+            nudge = "You've seen the actual GPU benchmark. Reflect on why the actual speedup differs from the roofline prediction. Then call 'done' with your analysis."
+        else:
+            nudge = "Continue optimizing or call 'verify' if you think optimization is complete."
+
+        messages.append({"role": "user", "content": f"Observation:\n{obs}\nReward: {reward:+.2f}\n\n{nudge}"})
 
         if done:
             break
@@ -265,7 +274,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="gpt-5.2", help="Model name")
     parser.add_argument("--provider", default="papyrus", choices=["papyrus", "copilot"],
                        help="LLM provider")
-    parser.add_argument("--max-steps", type=int, default=8)
+    parser.add_argument("--max-steps", type=int, default=12)
     args = parser.parse_args()
 
     if args.task == "all":
