@@ -90,6 +90,23 @@ TOOLS = {
         },
         "example": '{"tool": "benchmark", "args": {}}',
     },
+    "generate_kernel": {
+        "description": "Generate a Triton GPU kernel implementing the Flash-optimized operator. Uses templates for known patterns (online_logsumexp, online_argmin, online_softmax). Returns the generated code.",
+        "parameters": {
+            "custom_code": "str (optional) — provide your own Triton kernel code instead of using templates",
+        },
+        "example": '{"tool": "generate_kernel", "args": {}}',
+    },
+    "compile_and_test": {
+        "description": "Compile the generated Triton kernel and run correctness tests against the PyTorch reference implementation. Reports max/mean error.",
+        "parameters": {},
+        "example": '{"tool": "compile_and_test", "args": {}}',
+    },
+    "benchmark_kernel": {
+        "description": "Benchmark the generated Triton kernel vs the naive materialized PyTorch baseline. This measures the REAL speedup from the generated CUDA code, not just Python-level operations.",
+        "parameters": {},
+        "example": '{"tool": "benchmark_kernel", "args": {}}',
+    },
 }
 
 
@@ -192,20 +209,20 @@ intermediate matrix materialization, using techniques like:
 2. Identify materialized intermediates (tensors written to HBM then read back)
 3. Apply optimizations to eliminate them (prefer fuse_and_online for large intermediates)
 4. Use 'verify' to check the optimization is valid
-5. Use 'benchmark' to measure ACTUAL GPU speedup — this is critical!
-6. REFLECT on the benchmark results:
-   - If actual speedup < roofline prediction, explain WHY (cache effects? kernel launch overhead? Python loop overhead?)
-   - If actual speedup > 1, confirm the IO optimization translates to real performance gain
-   - If actual speedup < 1, consider whether the optimization is still valuable (VRAM savings? larger scale?)
-7. Call 'done' with a final summary that includes both symbolic analysis AND benchmark results
+5. Use 'generate_kernel' to generate a Triton GPU kernel implementing the optimized operator
+6. Use 'compile_and_test' to compile the kernel and verify correctness against PyTorch reference
+7. Use 'benchmark_kernel' to measure ACTUAL GPU speedup of the generated kernel
+8. REFLECT on the results: compare symbolic IO prediction vs actual kernel performance
+9. If the kernel is incorrect or slow, you can generate a new one with 'generate_kernel' (custom_code=...)
+10. Call 'done' with final summary including IO analysis + kernel benchmark
 
 ## Response Format
 For each step, respond with:
 Thought: <your reasoning about what to do and why>
 Action: {{"tool": "<tool_name>", "args": {{...}}}}
 
-IMPORTANT: You MUST call 'benchmark' before 'done'. After seeing benchmark results,
-reflect on why actual speedup differs from roofline prediction.
+IMPORTANT: You MUST call 'generate_kernel' then 'compile_and_test' then 'benchmark_kernel' before 'done'.
+The generated Triton kernel is the REAL deliverable — not just symbolic analysis.
 """
         return prompt
 
@@ -228,6 +245,12 @@ reflect on why actual speedup differs from roofline prediction.
             return self._tool_verify()
         elif tool == "benchmark":
             return self._tool_benchmark(args)
+        elif tool == "generate_kernel":
+            return self._tool_generate_kernel(args)
+        elif tool == "compile_and_test":
+            return self._tool_compile_and_test(args)
+        elif tool == "benchmark_kernel":
+            return self._tool_benchmark_kernel(args)
         elif tool == "done":
             return self._tool_done()
         else:
@@ -423,6 +446,46 @@ reflect on why actual speedup differs from roofline prediction.
                 torch.cuda.empty_cache()
             except Exception:
                 pass
+
+    def _tool_generate_kernel(self, args: dict) -> tuple[str, float, bool]:
+        """Generate a Triton kernel for the current task."""
+        from io_env.triton_codegen import generate_kernel
+        custom_code = args.get("custom_code")
+        code, filepath = generate_kernel(self.task_name, custom_code)
+        if not code:
+            return filepath, 0.0, False  # filepath contains error message
+        self._kernel_path = filepath
+        # Show first 30 lines
+        lines = code.strip().split("\n")
+        preview = "\n".join(lines[:40])
+        if len(lines) > 40:
+            preview += f"\n... ({len(lines) - 40} more lines)"
+        obs = f"Generated Triton kernel: {filepath}\n\n{preview}"
+        return obs, 1.0, False
+
+    def _tool_compile_and_test(self, args: dict) -> tuple[str, float, bool]:
+        """Compile and test the generated kernel."""
+        from io_env.triton_codegen import compile_and_test
+        filepath = getattr(self, '_kernel_path', None)
+        obs = compile_and_test(self.task_name, self.params, filepath)
+        reward = 2.0 if "PASS" in obs else -1.0
+        return obs, reward, False
+
+    def _tool_benchmark_kernel(self, args: dict) -> tuple[str, float, bool]:
+        """Benchmark the generated Triton kernel vs materialized baseline."""
+        from io_env.triton_codegen import benchmark_kernel
+        filepath = getattr(self, '_kernel_path', None)
+        obs = benchmark_kernel(self.task_name, self.params, filepath)
+        # Extract speedup for reward
+        reward = 0.0
+        for line in obs.split("\n"):
+            if "Speedup:" in line:
+                try:
+                    spd = float(line.split(":")[-1].strip().rstrip("×"))
+                    reward = 3.0 * (spd - 1.0)
+                except ValueError:
+                    pass
+        return obs, max(reward, 0.0), False
 
     def _tool_done(self) -> tuple[str, float, bool]:
         reward = compute_reward(self.baseline_report, self.current_report)

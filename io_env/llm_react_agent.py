@@ -239,9 +239,19 @@ def run_llm_react_agent(task: str, model: str = "gpt-5.2",
 
         # Contextual nudge based on what just happened
         if tool == "verify" and "ALL PASSED" in obs:
-            nudge = "Verification passed. Now run 'benchmark' to measure actual GPU speedup, then reflect on the results."
+            nudge = ("Verification passed! Now you MUST generate an actual Triton GPU kernel. "
+                     "Call 'generate_kernel' to create the kernel, then 'compile_and_test' to verify it, "
+                     "then 'benchmark_kernel' to measure real speedup.")
+        elif tool == "generate_kernel":
+            nudge = "Kernel generated. Now call 'compile_and_test' to compile and verify correctness."
+        elif tool == "compile_and_test" and "PASS" in obs:
+            nudge = "Kernel compiled and passed correctness test! Now call 'benchmark_kernel' to measure actual GPU speedup."
+        elif tool == "benchmark_kernel":
+            nudge = ("You've seen the actual Triton kernel benchmark. Reflect on the speedup vs roofline prediction. "
+                     "Then call 'done' with your final analysis.")
         elif tool == "benchmark":
-            nudge = "You've seen the actual GPU benchmark. Reflect on why the actual speedup differs from the roofline prediction. Then call 'done' with your analysis."
+            nudge = ("That was the Python-level benchmark. Now generate the REAL Triton kernel: "
+                     "call 'generate_kernel', then 'compile_and_test', then 'benchmark_kernel'.")
         else:
             nudge = "Continue optimizing or call 'verify' if you think optimization is complete."
 
