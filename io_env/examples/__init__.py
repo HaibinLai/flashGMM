@@ -375,3 +375,183 @@ EXAMPLES = {
         "default_params": {"N": 4096, "V": 32000, "BV": 1024},
     },
 }
+
+
+# ============================================================================
+# LayerNorm
+# ============================================================================
+
+def layernorm_baseline() -> ComputationGraph:
+    """Standard LayerNorm: mean → variance → normalize. Materializes intermediate stats."""
+    return ComputationGraph(
+        name="layernorm_standard",
+        description="Standard LayerNorm with materialized mean and variance intermediates",
+        inputs={
+            "X": TensorSpec(shape=("N", "d"), dtype="f32"),
+            "gamma": TensorSpec(shape=("d",), dtype="f32"),
+            "beta": TensorSpec(shape=("d",), dtype="f32"),
+        },
+        operations=[
+            Op(name="compute_mean",
+               reads=["X"],
+               computes="row_reduce_mean",
+               flops_fn=lambda p: p["N"] * p["d"],
+               output=TensorSpec(shape=("N",), dtype="f32", storage="HBM"),
+               output_name="mean",
+               notes="Materialize per-row mean"),
+
+            Op(name="compute_var",
+               reads=["X", "mean"],
+               computes="row_reduce_variance",
+               flops_fn=lambda p: p["N"] * p["d"] * 3,
+               output=TensorSpec(shape=("N",), dtype="f32", storage="HBM"),
+               output_name="var",
+               notes="Materialize per-row variance (reads X again!)"),
+
+            Op(name="normalize",
+               reads=["X", "mean", "var", "gamma", "beta"],
+               computes="elementwise_affine",
+               flops_fn=lambda p: p["N"] * p["d"] * 5,
+               output=TensorSpec(shape=("N", "d"), dtype="f32", storage="HBM"),
+               output_name="Y"),
+        ],
+        outputs=["Y"],
+    )
+
+
+def layernorm_flash() -> ComputationGraph:
+    """Flash LayerNorm: single-pass Welford + normalize."""
+    return ComputationGraph(
+        name="layernorm_flash",
+        description="Flash LayerNorm: single-pass Welford mean+var, fused normalize",
+        inputs={
+            "X": TensorSpec(shape=("N", "d"), dtype="f32"),
+            "gamma": TensorSpec(shape=("d",), dtype="f32"),
+            "beta": TensorSpec(shape=("d",), dtype="f32"),
+        },
+        operations=[
+            FusedOp(
+                name="flash_layernorm",
+                reads=["X", "gamma", "beta"],
+                computes="welford_mean_var+normalize[online_welford]",
+                flops_fn=lambda p: p["N"] * p["d"] * 9,
+                output=TensorSpec(shape=("N", "d"), dtype="f32", storage="HBM"),
+                output_name="Y",
+                online_state=OnlineStateSpec(
+                    variables={"running_mean": "scalar", "running_M2": "scalar", "count": "scalar"},
+                    algorithm="online_welford",
+                    output_shape=("N", "d"),
+                ),
+                notes="2-pass: Welford mean+var (1 read) + normalize (1 read, 1 write). No mean/var materialized.",
+            ),
+        ],
+        outputs=["Y"],
+    )
+
+
+# ============================================================================
+# Cosine Similarity (pairwise)
+# ============================================================================
+
+def cosine_similarity_baseline() -> ComputationGraph:
+    """Pairwise cosine similarity: normalize → matmul. Materializes norms and normalized matrix."""
+    return ComputationGraph(
+        name="cosine_similarity_standard",
+        description="Pairwise cosine similarity with materialized norms and normalized matrix",
+        inputs={
+            "X": TensorSpec(shape=("N", "d"), dtype="f32"),
+        },
+        operations=[
+            Op(name="compute_norms",
+               reads=["X"],
+               computes="row_reduce_l2norm",
+               flops_fn=lambda p: p["N"] * p["d"] * 2,
+               output=TensorSpec(shape=("N",), dtype="f32", storage="HBM"),
+               output_name="norms",
+               notes="Materialize L2 norms"),
+
+            Op(name="normalize_rows",
+               reads=["X", "norms"],
+               computes="elementwise_div",
+               flops_fn=lambda p: p["N"] * p["d"],
+               output=TensorSpec(shape=("N", "d"), dtype="f32", storage="HBM"),
+               output_name="X_normed",
+               notes="Materialize normalized X (same size as input!)"),
+
+            Op(name="matmul_similarity",
+               reads=["X_normed"],
+               computes="matmul_self",
+               flops_fn=lambda p: 2 * p["N"] * p["N"] * p["d"],
+               output=TensorSpec(shape=("N", "N"), dtype="f32", storage="HBM"),
+               output_name="S"),
+        ],
+        outputs=["S"],
+    )
+
+
+# ============================================================================
+# Contrastive Loss (InfoNCE / SimCLR style)
+# ============================================================================
+
+def contrastive_loss_baseline() -> ComputationGraph:
+    """InfoNCE contrastive loss: similarity → logsumexp → gather. Huge N×N intermediate."""
+    return ComputationGraph(
+        name="contrastive_loss_standard",
+        description="InfoNCE contrastive loss with materialized N×N similarity matrix",
+        inputs={
+            "Z": TensorSpec(shape=("N", "d"), dtype="f32"),
+            "labels": TensorSpec(shape=("N",), dtype="i32"),
+            "temperature": TensorSpec(shape=(1,), dtype="f32"),
+        },
+        operations=[
+            Op(name="compute_norms",
+               reads=["Z"],
+               computes="row_reduce_l2norm",
+               flops_fn=lambda p: p["N"] * p["d"] * 2,
+               output=TensorSpec(shape=("N",), dtype="f32", storage="HBM"),
+               output_name="norms"),
+
+            Op(name="compute_similarity",
+               reads=["Z", "norms", "temperature"],
+               computes="normalized_matmul",
+               flops_fn=lambda p: 2 * p["N"] * p["N"] * p["d"] + p["N"] * p["N"],
+               output=TensorSpec(shape=("N", "N"), dtype="f32", storage="HBM"),
+               output_name="sim_matrix",
+               notes="Materialize HUGE N×N similarity matrix!"),
+
+            Op(name="logsumexp_rows",
+               reads=["sim_matrix"],
+               computes="row_reduce_logsumexp",
+               flops_fn=lambda p: p["N"] * p["N"] * 3,
+               output=TensorSpec(shape=("N",), dtype="f32", storage="HBM"),
+               output_name="log_denom"),
+
+            Op(name="gather_positive",
+               reads=["sim_matrix", "labels", "log_denom"],
+               computes="gather_subtract",
+               flops_fn=lambda p: p["N"] * 3,
+               output=TensorSpec(shape=("N",), dtype="f32", storage="HBM"),
+               output_name="loss"),
+        ],
+        outputs=["loss"],
+    )
+
+
+# Update registry
+EXAMPLES.update({
+    "layernorm": {
+        "baseline": layernorm_baseline,
+        "flash": layernorm_flash,
+        "default_params": {"N": 16384, "d": 4096, "BN": 64},
+    },
+    "cosine_similarity": {
+        "baseline": cosine_similarity_baseline,
+        "flash": cosine_similarity_baseline,  # no flash version yet — let agent discover it
+        "default_params": {"N": 4096, "d": 256, "BN": 64},
+    },
+    "contrastive_loss": {
+        "baseline": contrastive_loss_baseline,
+        "flash": contrastive_loss_baseline,  # no flash version — agent must discover it
+        "default_params": {"N": 4096, "d": 128, "BN": 64},
+    },
+})

@@ -217,6 +217,68 @@ def reference_softmax(X: torch.Tensor) -> torch.Tensor:
 _KERNEL_DIR = os.path.join(tempfile.gettempdir(), "io_env_kernels")
 os.makedirs(_KERNEL_DIR, exist_ok=True)
 
+TRITON_TEMPLATES["layernorm"] = '''
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def _flash_layernorm_kernel(
+    X, Y, GAMMA, BETA,
+    N: tl.constexpr, d: tl.constexpr, BD: tl.constexpr,
+    eps: tl.constexpr,
+):
+    """
+    Flash LayerNorm: 2-pass Welford mean+var, fused normalize.
+    Pass 1: online Welford for mean and variance (1 read of X)
+    Pass 2: normalize with affine transform (1 read of X, 1 write of Y)
+    No mean/var materialized to HBM.
+    """
+    row = tl.program_id(0)
+
+    # Pass 1: Welford online mean + variance
+    mean = 0.0
+    M2 = 0.0
+    count = 0.0
+    for start in range(0, d, BD):
+        cols = start + tl.arange(0, BD)
+        mask = cols < d
+        x = tl.load(X + row * d + cols, mask=mask, other=0.0)
+        # Vectorized Welford update
+        count += tl.sum(mask.to(tl.float32))
+        delta = x - mean
+        mean += tl.sum(tl.where(mask, delta / count, 0.0))
+        delta2 = x - mean
+        M2 += tl.sum(tl.where(mask, delta * delta2, 0.0))
+
+    var = M2 / count
+    rstd = 1.0 / tl.sqrt(var + eps)
+
+    # Pass 2: normalize + affine
+    for start in range(0, d, BD):
+        cols = start + tl.arange(0, BD)
+        mask = cols < d
+        x = tl.load(X + row * d + cols, mask=mask, other=0.0)
+        g = tl.load(GAMMA + cols, mask=mask, other=1.0)
+        b = tl.load(BETA + cols, mask=mask, other=0.0)
+        y = (x - mean) * rstd * g + b
+        tl.store(Y + row * d + cols, y, mask=mask)
+
+
+def flash_layernorm(X, gamma, beta, eps=1e-5):
+    N, d = X.shape
+    Y = torch.empty_like(X)
+    BD = min(1024, triton.next_power_of_2(d))
+    _flash_layernorm_kernel[(N,)](X, Y, gamma, beta, N, d, BD, eps, num_warps=8)
+    return Y
+
+
+def reference_layernorm(X, gamma, beta, eps=1e-5):
+    mean = X.mean(dim=1, keepdim=True)
+    var = X.var(dim=1, keepdim=True, unbiased=False)
+    return (X - mean) / torch.sqrt(var + eps) * gamma + beta
+'''
+
 
 def generate_kernel(task: str, custom_code: str | None = None) -> tuple[str, str]:
     """
@@ -307,6 +369,16 @@ def compile_and_test(task: str, params: dict, filepath: str | None = None,
             max_err = (ref_out - flash_out).abs().max().item()
             mean_err = (ref_out - flash_out).abs().mean().item()
 
+        elif task == "layernorm":
+            N, d = params.get("N", 16384), params.get("d", 4096)
+            X = torch.randn(N, d, device="cuda")
+            gamma = torch.ones(d, device="cuda")
+            beta = torch.zeros(d, device="cuda")
+            ref_out = ref_fn(X, gamma, beta)
+            flash_out = flash_fn(X, gamma, beta)
+            max_err = (ref_out - flash_out).abs().max().item()
+            mean_err = (ref_out - flash_out).abs().mean().item()
+
         else:
             return f"No test harness for '{task}'"
 
@@ -380,6 +452,20 @@ def benchmark_kernel(task: str, params: dict, filepath: str | None = None,
         inputs_flash = (X,)
         inputs_ref = (X,)
         ref_fn_actual = ref_fn
+    elif task == "layernorm":
+        N, d = params.get("N", 16384), params.get("d", 4096)
+        X = torch.randn(N, d, device="cuda")
+        gamma = torch.ones(d, device="cuda")
+        beta = torch.zeros(d, device="cuda")
+        inputs_flash = (X, gamma, beta)
+        inputs_ref = (X, gamma, beta)
+
+        def naive_layernorm(X, gamma, beta):
+            mean = X.mean(dim=1, keepdim=True)
+            var = X.var(dim=1, keepdim=True, unbiased=False)
+            return (X - mean) / torch.sqrt(var + 1e-5) * gamma + beta
+
+        ref_fn_actual = naive_layernorm
     else:
         return f"No benchmark for '{task}'"
 
