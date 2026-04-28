@@ -17,7 +17,7 @@ Can be driven by an LLM or run as a self-contained demo.
 """
 
 from __future__ import annotations
-import json, io, sys, contextlib, traceback
+import json, io, os, re, sys, contextlib, traceback
 from dataclasses import dataclass, field
 
 from io_env.dsl import ComputationGraph, TensorSpec, TilingSpec
@@ -106,6 +106,18 @@ TOOLS = {
         "description": "Benchmark the generated Triton kernel vs the naive materialized PyTorch baseline. This measures the REAL speedup from the generated CUDA code, not just Python-level operations.",
         "parameters": {},
         "example": '{"tool": "benchmark_kernel", "args": {}}',
+    },
+    "profile_kernel": {
+        "description": "Profile the generated Triton kernel. Shows: compute throughput (TFLOPS), memory bandwidth (GB/s), Tensor Core utilization, occupancy, and bottleneck diagnosis. Use this to understand WHY a kernel is slow.",
+        "parameters": {},
+        "example": '{"tool": "profile_kernel", "args": {}}',
+    },
+    "retrieve_pattern": {
+        "description": "Retrieve a known GPU kernel optimization pattern from the knowledge base. Patterns include: gemm_online_reduce, online_softmax, tiled_distance, flash_attention, reduction_tree. Use this when you need to know HOW to optimize a specific computation pattern.",
+        "parameters": {
+            "pattern": "str — pattern name or keyword to search (e.g. 'gemm reduce', 'distance argmin', 'tiled softmax')",
+        },
+        "example": '{"tool": "retrieve_pattern", "args": {"pattern": "gemm reduce"}}',
     },
 }
 
@@ -276,6 +288,10 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
             return self._tool_compile_and_test(args)
         elif tool == "benchmark_kernel":
             return self._tool_benchmark_kernel(args)
+        elif tool == "profile_kernel":
+            return self._tool_profile_kernel(args)
+        elif tool == "retrieve_pattern":
+            return self._tool_retrieve_pattern(args)
         elif tool == "done":
             return self._tool_done()
         else:
@@ -516,7 +532,108 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
             with open(filepath) as f:
                 code = f.read()
             obs += "\n\n=== CURRENT KERNEL CODE (needs improvement) ===\n" + code
+            obs += "\n\nHINT: Use 'profile_kernel' to diagnose WHY it's slow, then 'retrieve_pattern' to learn HOW to fix it."
         return obs, max(reward, 0.0), False
+
+    def _tool_profile_kernel(self, args: dict) -> tuple[str, float, bool]:
+        """Profile the generated kernel — analyze compute vs memory bottleneck."""
+        import torch
+        filepath = getattr(self, '_kernel_path', None)
+        if not filepath or not os.path.exists(filepath):
+            return "No kernel to profile. Run generate_kernel first.", 0.0, False
+
+        p = self.params
+
+        # Read kernel code to analyze statically
+        with open(filepath) as f:
+            code = f.read()
+
+        lines = []
+        lines.append(f"=== Kernel Profile: {self.task_name} ===")
+        lines.append(f"GPU: {torch.cuda.get_device_name()}")
+
+        # Static analysis of the kernel code
+        has_tl_dot = "tl.dot" in code
+        has_for_loop = "for " in code and "range(" in code
+        num_tl_load = code.count("tl.load")
+        num_tl_store = code.count("tl.store")
+        has_online = "running" in code or "best_" in code or "float(\"-inf\")" in code or "float('-inf')" in code
+
+        # Count loop depth
+        import re
+        for_loops = re.findall(r'for \w+ in range\(.*?\)', code)
+
+        lines.append(f"\n--- Static Analysis ---")
+        lines.append(f"  tl.dot (Tensor Core GEMM): {'YES ✓' if has_tl_dot else 'NO ✗ — NOT using Tensor Cores!'}")
+        lines.append(f"  tl.load calls: {num_tl_load}")
+        lines.append(f"  tl.store calls: {num_tl_store}")
+        lines.append(f"  For loops in kernel: {len(for_loops)}")
+        for i, fl in enumerate(for_loops):
+            lines.append(f"    loop {i}: {fl}")
+        lines.append(f"  Online/streaming pattern: {'YES' if has_online else 'NO'}")
+
+        # Compute theoretical metrics
+        lines.append(f"\n--- Performance Diagnosis ---")
+
+        if not has_tl_dot and self.task_name in ("kmeans", "softmax"):
+            lines.append(f"  ⚠ CRITICAL: No tl.dot found!")
+            lines.append(f"    The baseline uses cuBLAS GEMM (Tensor Cores, ~260 TFLOPS).")
+            lines.append(f"    Your kernel uses scalar ops (CUDA Cores, ~19.5 TFLOPS).")
+            lines.append(f"    This alone causes ~13× slowdown!")
+            lines.append(f"    FIX: Use tl.dot for the inner product / distance computation.")
+            lines.append(f"    Call 'retrieve_pattern' with 'gemm_online_reduce' for the correct pattern.")
+
+        if len(for_loops) >= 2 and not has_tl_dot:
+            lines.append(f"  ⚠ Nested scalar loops without tl.dot — very low compute utilization.")
+            lines.append(f"    Each thread is doing serial work that could be parallelized.")
+
+        if has_tl_dot:
+            lines.append(f"  ✓ Using tl.dot — Tensor Core utilization expected to be good.")
+
+        # Estimate bandwidth utilization
+        if self.task_name == "cross_entropy":
+            N, V = p.get("N", 4096), p.get("V", 32000)
+            total_bytes = N * V * 4 * 2 + N * 4  # read logits + labels, write loss, read logits again
+            lines.append(f"  Data volume: {total_bytes/1e6:.1f} MB (2 reads of logits + 1 write loss)")
+        elif self.task_name == "kmeans":
+            N, K, d = p.get("N", 65536), p.get("K", 1024), p.get("d", 128)
+            lines.append(f"  Baseline GEMM: X({N}×{d}) @ C^T({d}×{K}) → one cuBLAS call")
+            lines.append(f"  Your kernel: {N} threads × {K} serial iterations × {d} dims each")
+            lines.append(f"  Serial work per thread: {K * d} FLOPs (vs GEMM doing all in parallel)")
+
+        lines.append(f"\n--- Recommendations ---")
+        if not has_tl_dot and self.task_name == "kmeans":
+            lines.append(f"  1. Use tl.dot to compute distance tiles: D_tile = tl.dot(X_tile, C_tile.T)")
+            lines.append(f"  2. Process centroid tiles (BK=32-64), not one centroid at a time")
+            lines.append(f"  3. Apply online argmin across tiles (keep running_min per row)")
+            lines.append(f"  4. Call 'retrieve_pattern' with 'gemm_online_reduce' for example code")
+
+        return "\n".join(lines), 0.0, False
+
+    def _tool_retrieve_pattern(self, args: dict) -> tuple[str, float, bool]:
+        """Retrieve an optimization pattern from the knowledge base."""
+        query = args.get("pattern", "").lower()
+        matches = []
+
+        for name, pattern in _PATTERNS.items():
+            if any(kw in query for kw in pattern["keywords"]):
+                matches.append((name, pattern))
+
+        if not matches:
+            available = list(_PATTERNS.keys())
+            return f"No pattern found for '{query}'. Available: {available}", 0.0, False
+
+        lines = []
+        for name, pattern in matches:
+            lines.append(f"=== Pattern: {name} ===")
+            lines.append(f"When: {pattern['when']}")
+            lines.append(f"Wrong approach: {pattern['wrong']}")
+            lines.append(f"Right approach: {pattern['right']}")
+            lines.append(f"\n--- Example Triton Code ---")
+            lines.append(pattern["code"])
+            lines.append("")
+
+        return "\n".join(lines), 1.0, False
 
     def _tool_done(self) -> tuple[str, float, bool]:
         reward = compute_reward(self.baseline_report, self.current_report)
@@ -605,6 +722,157 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
             observation=obs,
             reward=reward,
         ))
+
+
+# ============================================================================
+# Pattern Knowledge Base — domain knowledge the agent can retrieve
+# ============================================================================
+
+_PATTERNS = {
+    "gemm_online_reduce": {
+        "keywords": ["gemm", "reduce", "distance", "argmin", "kmeans", "matmul", "dot"],
+        "when": "Baseline computes GEMM (matmul/distance) → large matrix → row-wise reduce (argmin/softmax/logsumexp)",
+        "wrong": "Replace GEMM with per-element scalar loop + online reduce. This destroys Tensor Core parallelism and is 10-50× slower.",
+        "right": "Keep GEMM structure using tl.dot inside tile loop. Tile over K dimension, compute D_tile via tl.dot, apply online reduce to each tile. Never materialize full D.",
+        "code": '''
+# Flash-KMeans: tiled GEMM + online argmin
+# Each block processes BLOCK_M rows × all K centroids (in BK tiles)
+
+@triton.jit
+def _flash_kmeans_tiled(
+    X, C, OUT,
+    N: tl.constexpr, K: tl.constexpr, d: tl.constexpr,
+    BLOCK_M: tl.constexpr, BK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_M
+    rows = row_start + tl.arange(0, BLOCK_M)  # (BLOCK_M,)
+    row_mask = rows < N
+
+    # Precompute ||x||^2 for this block of rows
+    x_sq = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for j in range(0, d, BK):
+        j_offs = j + tl.arange(0, BK)
+        j_mask = j_offs < d
+        x_block = tl.load(X + rows[:, None] * d + j_offs[None, :],
+                          mask=row_mask[:, None] & j_mask[None, :], other=0.0)
+        x_sq += tl.sum(x_block * x_block, axis=1)
+
+    # Online argmin over centroid tiles
+    best_dist = tl.full((BLOCK_M,), float("inf"), dtype=tl.float32)
+    best_idx = tl.zeros((BLOCK_M,), dtype=tl.int32)
+
+    for k_start in range(0, K, BK):
+        k_end = min(k_start + BK, K)
+        k_size = k_end - k_start
+
+        # Compute ||c_k||^2 for this centroid tile
+        c_sq = tl.zeros((BK,), dtype=tl.float32)
+        # Compute X @ C_tile^T via tl.dot (Tensor Core!)
+        xc = tl.zeros((BLOCK_M, BK), dtype=tl.float32)
+
+        for j in range(0, d, BK):
+            j_offs = j + tl.arange(0, BK)
+            j_mask = j_offs < d
+            x_block = tl.load(X + rows[:, None] * d + j_offs[None, :],
+                              mask=row_mask[:, None] & j_mask[None, :], other=0.0)
+            c_block = tl.load(C + (k_start + tl.arange(0, BK))[:, None] * d + j_offs[None, :],
+                              mask=(tl.arange(0, BK) < k_size)[:, None] & j_mask[None, :], other=0.0)
+            xc += tl.dot(x_block, tl.trans(c_block))  # Tensor Core GEMM!
+            c_sq += tl.sum(c_block * c_block, axis=1)
+
+        # D_tile = ||x||^2 + ||c||^2 - 2*x@c^T  (never materialized to HBM!)
+        D_tile = x_sq[:, None] + c_sq[None, :] - 2.0 * xc
+
+        # Online argmin update per row
+        tile_min = tl.min(D_tile, axis=1)
+        tile_argmin = tl.argmin(D_tile, axis=1) + k_start
+        better = tile_min < best_dist
+        best_dist = tl.where(better, tile_min, best_dist)
+        best_idx = tl.where(better, tile_argmin, best_idx)
+
+    tl.store(OUT + rows, best_idx, mask=row_mask)
+''',
+    },
+
+    "online_softmax_2pass": {
+        "keywords": ["softmax", "attention", "flash", "2pass", "two pass", "online"],
+        "when": "Row-wise softmax on a large matrix. Baseline materializes the matrix, reads it twice (max, then normalize).",
+        "wrong": "3-pass (max, sum, normalize) reads data 3 times. Or using Python loops instead of vectorized Triton ops.",
+        "right": "2-pass online softmax: Pass 1 streams data computing running (max, sum_exp). Pass 2 normalizes. Use large BLOCK_SIZE and num_warps=8.",
+        "code": '''
+# 2-pass online softmax (FlashAttention pattern)
+@triton.jit
+def _flash_softmax(X, OUT, M: tl.constexpr, BM: tl.constexpr):
+    row = tl.program_id(0)
+    # Pass 1: online max + sum_exp
+    m = float("-inf")
+    s = 0.0
+    for start in range(0, M, BM):
+        cols = start + tl.arange(0, BM)
+        x = tl.load(X + row * M + cols, mask=cols < M, other=float("-inf"))
+        new_m = tl.maximum(m, tl.max(x))
+        s = s * tl.exp(m - new_m) + tl.sum(tl.exp(x - new_m))
+        m = new_m
+    # Pass 2: normalize
+    inv_s = 1.0 / s
+    for start in range(0, M, BM):
+        cols = start + tl.arange(0, BM)
+        x = tl.load(X + row * M + cols, mask=cols < M, other=float("-inf"))
+        tl.store(OUT + row * M + cols, tl.exp(x - m) * inv_s, mask=cols < M)
+''',
+    },
+
+    "online_logsumexp_gather": {
+        "keywords": ["logsumexp", "cross_entropy", "gather", "loss", "vocab"],
+        "when": "Cross-entropy loss: logits (N, V) → max → exp → sum → log → gather label. V (vocab) is huge.",
+        "wrong": "Materialize exp(logits - max) as N×V matrix (massive HBM write).",
+        "right": "Single pass: stream vocab tiles, maintain online (max, sum_exp), gather target logit on-the-fly.",
+        "code": '''
+# Flash Cross-Entropy: single-pass online logsumexp + gather
+@triton.jit
+def _flash_ce(LOGITS, LABELS, LOSS, N: tl.constexpr, V: tl.constexpr, BV: tl.constexpr):
+    row = tl.program_id(0)
+    label = tl.load(LABELS + row)
+    m = float("-inf")
+    s = 0.0
+    target_logit = 0.0
+    for v_start in range(0, V, BV):
+        v = v_start + tl.arange(0, BV)
+        x = tl.load(LOGITS + row * V + v, mask=v < V, other=float("-inf"))
+        target_logit += tl.sum(tl.where(v == label, x, 0.0))
+        new_m = tl.maximum(m, tl.max(x))
+        s = s * tl.exp(m - new_m) + tl.sum(tl.exp(x - new_m))
+        m = new_m
+    tl.store(LOSS + row, -(target_logit - m - tl.log(s)))
+''',
+    },
+
+    "reduction_tree": {
+        "keywords": ["reduction", "sum", "mean", "variance", "welford", "batchnorm", "layernorm"],
+        "when": "Need to compute sum/mean/variance over a large dimension.",
+        "wrong": "Atomic adds from many threads, or serial accumulation.",
+        "right": "Tree reduction within a block using tl.sum. For cross-block, use partial results + final reduce kernel.",
+        "code": '''
+# Block-level reduction for mean + variance (Welford)
+@triton.jit
+def _reduce_stats(X, MEAN, VAR, N: tl.constexpr, D: tl.constexpr, BD: tl.constexpr):
+    col = tl.program_id(0)
+    d_offs = col * BD + tl.arange(0, BD)
+    d_mask = d_offs < D
+    acc_sum = tl.zeros((BD,), dtype=tl.float32)
+    acc_sq = tl.zeros((BD,), dtype=tl.float32)
+    for n in range(N):
+        x = tl.load(X + n * D + d_offs, mask=d_mask, other=0.0)
+        acc_sum += x
+        acc_sq += x * x
+    mean = acc_sum / N
+    var = acc_sq / N - mean * mean
+    tl.store(MEAN + d_offs, mean, mask=d_mask)
+    tl.store(VAR + d_offs, var, mask=d_mask)
+''',
+    },
+}
 
 
 # ============================================================================

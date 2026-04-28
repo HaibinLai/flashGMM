@@ -259,9 +259,9 @@ def run_llm_react_agent(task: str, model: str = "gpt-5.2",
             is_slow = "slower" in obs.lower() or "0." in obs.split("Speedup:")[-1].split("×")[0] if "Speedup:" in obs else False
             if is_slow:
                 nudge = ("KERNEL IS SLOWER THAN BASELINE. You MUST improve it. "
-                         "Analyze why it's slow (per-row serial loop? no tiling? poor memory access?). "
-                         "Write an improved Triton kernel using generate_kernel with custom_code=<your improved code>. "
-                         "Key techniques: use tl.dot for matmuls, 2D tiling, maximize occupancy. "
+                         "Step 1: Call 'profile_kernel' to diagnose WHY it's slow. "
+                         "Step 2: Call 'retrieve_pattern' to learn the correct optimization pattern. "
+                         "Step 3: Write an improved kernel with generate_kernel(custom_code=...). "
                          "DO NOT call 'done' until speedup >= 1.0× or you've exhausted optimization options.")
             else:
                 nudge = ("Kernel achieves speedup! Reflect on the results. "
