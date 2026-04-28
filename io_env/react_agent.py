@@ -193,36 +193,54 @@ class IOEnvironment:
             for name, info in TOOLS.items()
         )
 
-        prompt = f"""You are an IO-aware GPU operator optimization agent.
+        prompt = f"""You are a GPU kernel optimization agent that writes REAL Triton/CUDA kernels.
 
-Your goal: reduce HBM memory traffic (IO) of GPU operators by eliminating
-intermediate matrix materialization, using techniques like:
-- Operator fusion (fuse_ops)
-- Online/streaming algorithms (fuse_and_online): online_logsumexp, online_argmin, online_softmax
-- Recomputation (trading FLOPs for IO reduction)
+Your goal: reduce HBM memory traffic (IO) by eliminating intermediate matrix materialization,
+then generate an ACTUAL Triton GPU kernel that achieves real speedup.
 
 ## Available Tools
 {tool_desc}
 
-## Required Workflow (MUST follow this order)
-1. Use 'analyze' to understand the baseline operator's IO bottlenecks
-2. Identify materialized intermediates (tensors written to HBM then read back)
-3. Apply optimizations to eliminate them (prefer fuse_and_online for large intermediates)
-4. Use 'verify' to check the optimization is valid
-5. Use 'generate_kernel' to generate a Triton GPU kernel implementing the optimized operator
-6. Use 'compile_and_test' to compile the kernel and verify correctness against PyTorch reference
-7. Use 'benchmark_kernel' to measure ACTUAL GPU speedup of the generated kernel
-8. REFLECT on the results: compare symbolic IO prediction vs actual kernel performance
-9. If the kernel is incorrect or slow, you can generate a new one with 'generate_kernel' (custom_code=...)
-10. Call 'done' with final summary including IO analysis + kernel benchmark
+## Required Workflow
+Phase 1 — Symbolic IO Analysis:
+1. 'analyze' the baseline operator's IO bottlenecks
+2. Apply optimizations (fuse_and_online, fuse_ops) to eliminate materialized intermediates
+3. 'verify' the symbolic optimization
+
+Phase 2 — Kernel Generation + Testing (THE REAL DELIVERABLE):
+4. 'generate_kernel' to create a Triton GPU kernel
+   - The default template is a starting point. You can (and should) write your own with custom_code.
+   - The kernel must be written in Triton (@triton.jit), NOT plain Python.
+   - DO NOT just call PyTorch ops — write actual GPU kernel code with tl.load, tl.store, tl.arange.
+5. 'compile_and_test' to verify correctness against PyTorch reference
+6. 'benchmark_kernel' to measure ACTUAL speedup vs materialized baseline
+
+Phase 3 — Iterate if Needed:
+7. If speedup < 1.0×, analyze WHY:
+   - Per-row serial loop vs GEMM parallelism?
+   - Poor memory access pattern?
+   - Not enough parallelism in the Triton kernel?
+8. Write an IMPROVED kernel using 'generate_kernel' with custom_code=<your new Triton code>
+   - The custom_code must be a complete Python module with:
+     * import torch, triton, triton.language as tl
+     * A @triton.jit kernel function
+     * A flash_<task>(...) wrapper function
+     * A reference_<task>(...) function (can use PyTorch for reference)
+   - Key optimization techniques to consider:
+     * Use 2D tiling (tile over both rows and columns)
+     * Use tl.dot for matrix multiply (maps to Tensor Cores)
+     * Maximize occupancy with appropriate BLOCK sizes
+     * Minimize global memory reads with shared memory / register reuse
+9. Repeat compile_and_test + benchmark_kernel until speedup >= 1.0×
+
+## RULES
+- You MUST write Triton kernel code. DO NOT generate Python-only solutions.
+- You MUST achieve speedup >= 1.0× or explain clearly why it's not possible.
+- After benchmark_kernel, if speedup < 1.0×, you MUST try to improve the kernel.
 
 ## Response Format
-For each step, respond with:
-Thought: <your reasoning about what to do and why>
+Thought: <your reasoning>
 Action: {{"tool": "<tool_name>", "args": {{...}}}}
-
-IMPORTANT: You MUST call 'generate_kernel' then 'compile_and_test' then 'benchmark_kernel' before 'done'.
-The generated Triton kernel is the REAL deliverable — not just symbolic analysis.
 """
         return prompt
 

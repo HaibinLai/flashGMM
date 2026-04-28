@@ -75,10 +75,10 @@ class LLMClient:
 
     def _chat_papyrus(self, messages: list[dict]) -> str:
         json_body = {"messages": messages}
-        max_retries = 3
+        max_retries = 10
         for attempt in range(max_retries):
             try:
-                response = requests.post(self.endpoint, headers=self.headers, json=json_body)
+                response = requests.post(self.endpoint, headers=self.headers, json=json_body, timeout=120)
                 response.raise_for_status()
                 resp_json = response.json()
                 content = resp_json['choices'][0]['message']['content']
@@ -87,16 +87,21 @@ class LLMClient:
                 self.total_completion_tokens += usage.get('completion_tokens', 0)
                 self.num_calls += 1
                 return content
-            except requests.exceptions.HTTPError as e:
-                status = e.response.status_code if e.response else None
+            except (requests.exceptions.HTTPError, requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout) as e:
+                status = getattr(getattr(e, 'response', None), 'status_code', None)
                 if status == 401 and attempt < max_retries - 1:
                     print(f"  [LLM] Token expired, refreshing...")
+                    time.sleep(5)
                     self._refresh_token()
-                elif status in (429, 408, 400) and attempt < max_retries - 1:
-                    wait = 30 * (attempt + 1)
-                    print(f"  [LLM] Rate limited ({status}), waiting {wait}s...")
+                elif attempt < max_retries - 1:
+                    wait = 10
+                    print(f"  [LLM] Error ({status or type(e).__name__}), retry {attempt+1}/{max_retries} in {wait}s...")
                     time.sleep(wait)
+                    if status == 401:
+                        self._refresh_token()
                 else:
+                    print(f"  [LLM] Max retries ({max_retries}) reached. Last error: {e}")
                     raise
 
     def _chat_copilot(self, messages: list[dict]) -> str:
@@ -246,9 +251,21 @@ def run_llm_react_agent(task: str, model: str = "gpt-5.2",
             nudge = "Kernel generated. Now call 'compile_and_test' to compile and verify correctness."
         elif tool == "compile_and_test" and "PASS" in obs:
             nudge = "Kernel compiled and passed correctness test! Now call 'benchmark_kernel' to measure actual GPU speedup."
+        elif tool == "compile_and_test" and "FAIL" in obs:
+            nudge = ("Kernel correctness test FAILED. Analyze the error and write a fixed kernel "
+                     "using generate_kernel with custom_code=<your corrected Triton code>.")
         elif tool == "benchmark_kernel":
-            nudge = ("You've seen the actual Triton kernel benchmark. Reflect on the speedup vs roofline prediction. "
-                     "Then call 'done' with your final analysis.")
+            # Check if speedup < 1.0
+            is_slow = "slower" in obs.lower() or "0." in obs.split("Speedup:")[-1].split("×")[0] if "Speedup:" in obs else False
+            if is_slow:
+                nudge = ("KERNEL IS SLOWER THAN BASELINE. You MUST improve it. "
+                         "Analyze why it's slow (per-row serial loop? no tiling? poor memory access?). "
+                         "Write an improved Triton kernel using generate_kernel with custom_code=<your improved code>. "
+                         "Key techniques: use tl.dot for matmuls, 2D tiling, maximize occupancy. "
+                         "DO NOT call 'done' until speedup >= 1.0× or you've exhausted optimization options.")
+            else:
+                nudge = ("Kernel achieves speedup! Reflect on the results. "
+                         "Call 'done' with your final analysis including IO reduction + kernel speedup.")
         elif tool == "benchmark":
             nudge = ("That was the Python-level benchmark. Now generate the REAL Triton kernel: "
                      "call 'generate_kernel', then 'compile_and_test', then 'benchmark_kernel'.")
@@ -284,7 +301,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="gpt-5.2", help="Model name")
     parser.add_argument("--provider", default="papyrus", choices=["papyrus", "copilot"],
                        help="LLM provider")
-    parser.add_argument("--max-steps", type=int, default=12)
+    parser.add_argument("--max-steps", type=int, default=20)
     args = parser.parse_args()
 
     if args.task == "all":
