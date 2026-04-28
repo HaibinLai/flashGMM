@@ -1,0 +1,452 @@
+/*
+ * Flash-GMM: CUDA GPU Kernels (Optimized)
+ *
+ * Two core kernels implementing the Flash-GMM approach:
+ *
+ *   Kernel 1 (flash_log_normalizer_kernel):
+ *     - Each block handles BN points
+ *     - Streams centroid tiles (BK) through shared memory
+ *     - Maintains online log-sum-exp in registers
+ *     - Uses precomputed inv_var (multiply vs divide) and half_const (no logf)
+ *     - Output: log_normalizer ∈ R^N (only O(N), not O(NK))
+ *
+ *   Kernel 2 (flash_accumulate_stats_kernel):
+ *     - 2D grid: (point_tiles, centroid_tiles)
+ *     - Two-phase approach: compute γ first, then accumulate in parallel
+ *     - Phase 1: threads parallel over points → gamma_buf in shared memory
+ *     - Phase 2: threads parallel over (k,j) output entries → ZERO atomics
+ *     - Output: O(Kd) sufficient statistics
+ *
+ * Together these two kernels implement one full EM iteration
+ * with ZERO N×K matrix materialization in HBM.
+ *
+ * Optimizations vs v1:
+ *   - Precomputed inv_var eliminates division in inner loop (~4× per element)
+ *   - Precomputed half_const eliminates logf() in inner loop (~5× per element)
+ *   - Two-phase accumulation eliminates ALL shared memory atomics in Kernel 2
+ *     (was: BN*BK*2*d atomics/block → now: 0)
+ */
+
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <float.h>
+
+static constexpr float LOG_2PI = 1.8378770664093453f;
+
+// ============================================================================
+// Kernel 1: Flash Log-Normalizer (Pass 1 of fused E+M)
+//
+// Grid:  ceil(N / BN) blocks
+// Block: THREADS threads
+// Each thread handles ceil(BN / THREADS) points
+//
+// Shared memory layout:
+//   mu_tile     [BK * d]     centroid means
+//   iv_tile     [BK * d]     precomputed 1/var (multiply, not divide!)
+//   hc_tile     [BK]         precomputed half_const = log_pi - 0.5*(d*LOG_2PI + log_var_sum)
+//
+// Per-thread registers:
+//   running_max, running_sum_exp
+//
+// Inner loop is pure FMA: diff*diff*inv_var → ~5× fewer cycles than logf+div
+// ============================================================================
+template <int BK_COMPILE>
+__global__ void flash_log_normalizer_kernel(
+    const float* __restrict__ X,            // (N, d)
+    const float* __restrict__ mu,           // (K, d)
+    const float* __restrict__ inv_var,      // (K, d) = 1/var, PRECOMPUTED
+    const float* __restrict__ half_const,   // (K,) = log_pi - 0.5*(d*LOG_2PI + Σlog(var)), PRECOMPUTED
+    float* __restrict__ log_normalizer,     // (N,) output
+    int N, int K, int d, int BN
+) {
+    extern __shared__ float smem[];
+
+    float* mu_tile = smem;                       // BK * d
+    float* iv_tile = mu_tile + BK_COMPILE * d;   // BK * d
+    float* hc_tile = iv_tile + BK_COMPILE * d;   // BK
+
+    int block_start = blockIdx.x * BN;
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+
+    for (int local_n = tid; local_n < BN; local_n += nthreads) {
+        int n = block_start + local_n;
+        if (n >= N) continue;
+
+        float running_max = -FLT_MAX;
+        float running_sum_exp = 0.0f;
+
+        for (int t = 0; t < K; t += BK_COMPILE) {
+            int tile_k = min(BK_COMPILE, K - t);
+
+            // Cooperative load of centroid tile
+            __syncthreads();
+            for (int idx = tid; idx < tile_k * d; idx += nthreads) {
+                int kk = idx / d;
+                int jj = idx % d;
+                mu_tile[kk * d + jj] = mu[(t + kk) * d + jj];
+                iv_tile[kk * d + jj] = inv_var[(t + kk) * d + jj];
+            }
+            if (tid < tile_k) {
+                hc_tile[tid] = half_const[t + tid];
+            }
+            __syncthreads();
+
+            for (int kk = 0; kk < tile_k; kk++) {
+                float mahal = 0.0f;
+                for (int j = 0; j < d; j++) {
+                    float diff = X[n * d + j] - mu_tile[kk * d + j];
+                    mahal += diff * diff * iv_tile[kk * d + j];  // mul, not div!
+                }
+                float ll = hc_tile[kk] - 0.5f * mahal;  // no logf!
+
+                // Online log-sum-exp
+                if (ll > running_max) {
+                    running_sum_exp = running_sum_exp * expf(running_max - ll) + 1.0f;
+                    running_max = ll;
+                } else {
+                    running_sum_exp += expf(ll - running_max);
+                }
+            }
+        }
+
+        log_normalizer[n] = running_max + logf(running_sum_exp);
+    }
+}
+
+// ============================================================================
+// Kernel 2: Flash Accumulate Statistics (Pass 2 of fused E+M) — OPTIMIZED
+//
+// Grid:  (ceil(N / BN), ceil(K / BK))  — 2D
+// Block: THREADS threads
+//
+// Two-phase approach eliminates ALL shared memory atomics:
+//
+//   Phase 1 (threads || over points):
+//     Each thread computes gamma for its assigned points and all BK centroids.
+//     Stores gamma in shared gamma_buf[BN × BK].
+//
+//   Phase 2 (threads || over (k,j) output entries):
+//     Each thread owns a subset of the BK×d output entries.
+//     For each owned (kk, j), loops over all BN points, reading gamma from
+//     shared mem (broadcast) and X from global (coalesced), accumulating
+//     sum_s and sum_sq in registers. Writes once to local_s, local_sq.
+//     → ZERO shared memory atomics!
+//
+//   Phase 3: Merge to global buffers (one atomicAdd per output entry).
+//
+// Shared memory layout:
+//   mu_tile     [BK * d]
+//   iv_tile     [BK * d]
+//   hc_tile     [BK]
+//   gamma_buf   [BN * BK]    ← new: stores gamma for 2-phase
+//   local_n     [BK]
+//   local_s     [BK * d]     ← no longer written via atomics
+//   local_sq    [BK * d]     ← no longer written via atomics
+// ============================================================================
+template <int BK_COMPILE>
+__global__ void flash_accumulate_stats_kernel(
+    const float* __restrict__ X,                // (N, d)
+    const float* __restrict__ mu,               // (K, d)
+    const float* __restrict__ inv_var,          // (K, d) PRECOMPUTED
+    const float* __restrict__ half_const,       // (K,) PRECOMPUTED
+    const float* __restrict__ log_normalizer,   // (N,)
+    float* __restrict__ global_n_k,             // (K,) output
+    float* __restrict__ global_s_k,             // (K, d) output
+    float* __restrict__ global_sq_k,            // (K, d) output
+    int N, int K, int d, int BN
+) {
+    extern __shared__ float smem[];
+
+    int tile_k = min(BK_COMPILE, K - (int)blockIdx.y * BK_COMPILE);
+    int k_start = blockIdx.y * BK_COMPILE;
+    int block_start = blockIdx.x * BN;
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+    int valid_n = min(BN, N - block_start);
+
+    // Shared memory layout
+    float* mu_tile   = smem;
+    float* iv_tile   = mu_tile + BK_COMPILE * d;
+    float* hc_tile   = iv_tile + BK_COMPILE * d;
+    float* gamma_buf = hc_tile + BK_COMPILE;
+    float* local_n   = gamma_buf + BN * BK_COMPILE;
+    float* local_s   = local_n + BK_COMPILE;
+    float* local_sq  = local_s + BK_COMPILE * d;
+
+    // Load centroid tile
+    for (int idx = tid; idx < tile_k * d; idx += nthreads) {
+        int kk = idx / d;
+        int jj = idx % d;
+        mu_tile[kk * d + jj] = mu[(k_start + kk) * d + jj];
+        iv_tile[kk * d + jj] = inv_var[(k_start + kk) * d + jj];
+    }
+    if (tid < tile_k) {
+        hc_tile[tid] = half_const[k_start + tid];
+    }
+    __syncthreads();
+
+    // ---- Phase 1: Compute gamma values (threads parallel over points) ----
+    for (int nn = tid; nn < BN; nn += nthreads) {
+        if (nn < valid_n) {
+            int n = block_start + nn;
+            float ln_val = log_normalizer[n];
+            for (int kk = 0; kk < tile_k; kk++) {
+                float mahal = 0.0f;
+                for (int j = 0; j < d; j++) {
+                    float diff = X[n * d + j] - mu_tile[kk * d + j];
+                    mahal += diff * diff * iv_tile[kk * d + j];
+                }
+                float ll = hc_tile[kk] - 0.5f * mahal;
+                gamma_buf[nn * BK_COMPILE + kk] = expf(ll - ln_val);
+            }
+        } else {
+            for (int kk = 0; kk < tile_k; kk++)
+                gamma_buf[nn * BK_COMPILE + kk] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // ---- Phase 2: Accumulate s_k, sq_k — ZERO shared memory atomics! ----
+    // Each thread owns a subset of the tile_k × d output entries.
+    // Within a warp: consecutive threads handle consecutive j values
+    //   → X reads are perfectly coalesced
+    //   → gamma reads are broadcast (same kk within warp)
+    int total_entries = tile_k * d;
+    for (int idx = tid; idx < total_entries; idx += nthreads) {
+        int kk = idx / d;
+        int j  = idx % d;
+        float sum_s = 0.0f, sum_sq = 0.0f;
+        for (int nn = 0; nn < valid_n; nn++) {
+            float g = gamma_buf[nn * BK_COMPILE + kk];
+            float x_val = X[(block_start + nn) * d + j];
+            sum_s  += g * x_val;
+            sum_sq += g * x_val * x_val;
+        }
+        local_s[idx]  = sum_s;   // direct write, no atomic!
+        local_sq[idx] = sum_sq;  // direct write, no atomic!
+    }
+
+    // ---- Phase 2.5: Accumulate n_k ----
+    for (int kk = tid; kk < tile_k; kk += nthreads) {
+        float sum_n = 0.0f;
+        for (int nn = 0; nn < valid_n; nn++) {
+            sum_n += gamma_buf[nn * BK_COMPILE + kk];
+        }
+        local_n[kk] = sum_n;
+    }
+    __syncthreads();
+
+    // ---- Phase 3: Merge to global (one atomic per output entry) ----
+    for (int idx = tid; idx < tile_k; idx += nthreads) {
+        atomicAdd(&global_n_k[k_start + idx], local_n[idx]);
+    }
+    for (int idx = tid; idx < tile_k * d; idx += nthreads) {
+        atomicAdd(&global_s_k[k_start * d + idx], local_s[idx]);
+        atomicAdd(&global_sq_k[k_start * d + idx], local_sq[idx]);
+    }
+}
+
+// ============================================================================
+// Kernel 3: Compute new parameters from sufficient statistics
+// ============================================================================
+__global__ void update_params_kernel(
+    const float* __restrict__ n_k,     // (K,)
+    const float* __restrict__ s_k,     // (K, d)
+    const float* __restrict__ sq_k,    // (K, d)
+    float* __restrict__ new_mu,        // (K, d)
+    float* __restrict__ new_var,       // (K, d)
+    float* __restrict__ new_log_pi,    // (K,)
+    int K, int d, int N
+) {
+    int k = blockIdx.x;
+    if (k >= K) return;
+
+    float inv_nk = 1.0f / fmaxf(n_k[k], 1e-8f);
+
+    for (int j = threadIdx.x; j < d; j += blockDim.x) {
+        float mu_kj = s_k[k * d + j] * inv_nk;
+        new_mu[k * d + j] = mu_kj;
+        float var_kj = sq_k[k * d + j] * inv_nk - mu_kj * mu_kj;
+        new_var[k * d + j] = fmaxf(var_kj, 1e-6f);
+    }
+
+    if (threadIdx.x == 0) {
+        new_log_pi[k] = logf(fmaxf(n_k[k] / N, 1e-8f));
+    }
+}
+
+// ============================================================================
+// Standard E-step kernel (baseline): materializes full L ∈ R^{N×K}
+// ============================================================================
+__global__ void standard_e_step_kernel(
+    const float* __restrict__ X,
+    const float* __restrict__ mu,
+    const float* __restrict__ var,
+    const float* __restrict__ log_pi,
+    float* __restrict__ L,               // (N, K) materialized!
+    int N, int K, int d
+) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+
+    for (int k = 0; k < K; k++) {
+        float log_det = 0.0f;
+        float mahal = 0.0f;
+        for (int j = 0; j < d; j++) {
+            float v = var[k * d + j];
+            log_det += logf(v);
+            float diff = X[n * d + j] - mu[k * d + j];
+            mahal += diff * diff / v;
+        }
+        L[n * K + k] = log_pi[k] - 0.5f * (d * LOG_2PI + log_det + mahal);
+    }
+}
+
+__global__ void logsumexp_normalize_kernel(
+    const float* __restrict__ L,           // (N, K)
+    float* __restrict__ gamma,             // (N, K) output
+    float* __restrict__ log_normalizer,    // (N,) output
+    int N, int K
+) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+
+    float max_val = -FLT_MAX;
+    for (int k = 0; k < K; k++) {
+        max_val = fmaxf(max_val, L[n * K + k]);
+    }
+    float sum_exp = 0.0f;
+    for (int k = 0; k < K; k++) {
+        sum_exp += expf(L[n * K + k] - max_val);
+    }
+    float ln = max_val + logf(sum_exp);
+    log_normalizer[n] = ln;
+    for (int k = 0; k < K; k++) {
+        gamma[n * K + k] = expf(L[n * K + k] - ln);
+    }
+}
+
+// ============================================================================
+// ATen Launcher Functions
+// ============================================================================
+
+// Standard E-step (materializes L)
+std::vector<torch::Tensor> standard_e_step_cuda(
+    torch::Tensor X, torch::Tensor mu, torch::Tensor var, torch::Tensor log_pi
+) {
+    int N = X.size(0), d = X.size(1), K = mu.size(0);
+    auto L = torch::empty({N, K}, X.options());
+    auto gamma = torch::empty({N, K}, X.options());
+    auto log_normalizer = torch::empty({N}, X.options());
+
+    int threads = 256;
+    int blocks = (N + threads - 1) / threads;
+
+    standard_e_step_kernel<<<blocks, threads>>>(
+        X.data_ptr<float>(), mu.data_ptr<float>(), var.data_ptr<float>(),
+        log_pi.data_ptr<float>(), L.data_ptr<float>(), N, K, d);
+
+    logsumexp_normalize_kernel<<<blocks, threads>>>(
+        L.data_ptr<float>(), gamma.data_ptr<float>(),
+        log_normalizer.data_ptr<float>(), N, K);
+
+    return {gamma, log_normalizer};
+}
+
+// Flash E+M fused (ZERO N×K materialization) — OPTIMIZED
+std::vector<torch::Tensor> flash_em_fused_cuda(
+    torch::Tensor X, torch::Tensor mu, torch::Tensor var, torch::Tensor log_pi,
+    int BN, int BK
+) {
+    int N = X.size(0), d = X.size(1), K = mu.size(0);
+
+    // ---- Precompute (tiny O(Kd) work, eliminates logf+div from hot loop) ----
+    auto inv_var = var.reciprocal();                                          // (K, d)
+    auto log_var_sum = var.log().sum(/*dim=*/1);                             // (K,)
+    auto half_const = log_pi - 0.5f * (d * LOG_2PI + log_var_sum);           // (K,)
+
+    auto log_normalizer = torch::empty({N}, X.options());
+    auto n_k = torch::zeros({K}, X.options());
+    auto s_k = torch::zeros({K, d}, X.options());
+    auto sq_k = torch::zeros({K, d}, X.options());
+    auto new_mu = torch::empty({K, d}, X.options());
+    auto new_var = torch::empty({K, d}, X.options());
+    auto new_log_pi = torch::empty({K}, X.options());
+
+    int threads = 256;
+
+    // ---- Pass 1: Compute log_normalizer ----
+    {
+        int grid_n = (N + BN - 1) / BN;
+        // Shared memory: mu_tile(BK*d) + iv_tile(BK*d) + hc_tile(BK)
+        size_t smem_bytes = (2 * BK * d + BK) * sizeof(float);
+
+        // Dispatch by BK
+        if (BK <= 4) {
+            flash_log_normalizer_kernel<4><<<grid_n, threads, smem_bytes>>>(
+                X.data_ptr<float>(), mu.data_ptr<float>(), inv_var.data_ptr<float>(),
+                half_const.data_ptr<float>(), log_normalizer.data_ptr<float>(),
+                N, K, d, BN);
+        } else if (BK <= 8) {
+            flash_log_normalizer_kernel<8><<<grid_n, threads, smem_bytes>>>(
+                X.data_ptr<float>(), mu.data_ptr<float>(), inv_var.data_ptr<float>(),
+                half_const.data_ptr<float>(), log_normalizer.data_ptr<float>(),
+                N, K, d, BN);
+        } else if (BK <= 16) {
+            flash_log_normalizer_kernel<16><<<grid_n, threads, smem_bytes>>>(
+                X.data_ptr<float>(), mu.data_ptr<float>(), inv_var.data_ptr<float>(),
+                half_const.data_ptr<float>(), log_normalizer.data_ptr<float>(),
+                N, K, d, BN);
+        } else {
+            flash_log_normalizer_kernel<32><<<grid_n, threads, smem_bytes>>>(
+                X.data_ptr<float>(), mu.data_ptr<float>(), inv_var.data_ptr<float>(),
+                half_const.data_ptr<float>(), log_normalizer.data_ptr<float>(),
+                N, K, d, BN);
+        }
+    }
+
+    // ---- Pass 2: Accumulate sufficient statistics ----
+    {
+        dim3 grid((N + BN - 1) / BN, (K + BK - 1) / BK);
+        // Shared memory: mu_tile + iv_tile + hc_tile + gamma_buf + local_n + local_s + local_sq
+        size_t smem_bytes = (2 * BK * d + BK + BN * BK + BK + 2 * BK * d) * sizeof(float);
+
+        if (BK <= 4) {
+            flash_accumulate_stats_kernel<4><<<grid, threads, smem_bytes>>>(
+                X.data_ptr<float>(), mu.data_ptr<float>(), inv_var.data_ptr<float>(),
+                half_const.data_ptr<float>(), log_normalizer.data_ptr<float>(),
+                n_k.data_ptr<float>(), s_k.data_ptr<float>(), sq_k.data_ptr<float>(),
+                N, K, d, BN);
+        } else if (BK <= 8) {
+            flash_accumulate_stats_kernel<8><<<grid, threads, smem_bytes>>>(
+                X.data_ptr<float>(), mu.data_ptr<float>(), inv_var.data_ptr<float>(),
+                half_const.data_ptr<float>(), log_normalizer.data_ptr<float>(),
+                n_k.data_ptr<float>(), s_k.data_ptr<float>(), sq_k.data_ptr<float>(),
+                N, K, d, BN);
+        } else if (BK <= 16) {
+            flash_accumulate_stats_kernel<16><<<grid, threads, smem_bytes>>>(
+                X.data_ptr<float>(), mu.data_ptr<float>(), inv_var.data_ptr<float>(),
+                half_const.data_ptr<float>(), log_normalizer.data_ptr<float>(),
+                n_k.data_ptr<float>(), s_k.data_ptr<float>(), sq_k.data_ptr<float>(),
+                N, K, d, BN);
+        } else {
+            flash_accumulate_stats_kernel<32><<<grid, threads, smem_bytes>>>(
+                X.data_ptr<float>(), mu.data_ptr<float>(), inv_var.data_ptr<float>(),
+                half_const.data_ptr<float>(), log_normalizer.data_ptr<float>(),
+                n_k.data_ptr<float>(), s_k.data_ptr<float>(), sq_k.data_ptr<float>(),
+                N, K, d, BN);
+        }
+    }
+
+    // ---- Compute new parameters ----
+    {
+        update_params_kernel<<<K, std::min(d, 256)>>>(
+            n_k.data_ptr<float>(), s_k.data_ptr<float>(), sq_k.data_ptr<float>(),
+            new_mu.data_ptr<float>(), new_var.data_ptr<float>(),
+            new_log_pi.data_ptr<float>(), K, d, N);
+    }
+
+    return {new_mu, new_var, new_log_pi, log_normalizer};
+}
