@@ -53,7 +53,7 @@ def gmm_estep_baseline() -> ComputationGraph:
                output=TensorSpec(shape=("N", "K"), dtype="f32", storage="HBM"),
                output_name="gamma"),
         ],
-        outputs=["gamma", "log_norm"],
+        outputs=["log_norm"],
     )
 
 

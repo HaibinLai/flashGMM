@@ -385,7 +385,8 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
             results.append(f"  [PASS] All outputs produced: {self.graph.outputs}")
             passed += 1
         else:
-            results.append(f"  [FAIL] Missing outputs: {missing}")
+            results.append(f"  [FAIL] Missing outputs: {missing}. "
+                           f"HINT: Use output_name='{missing[0]}' in fuse_and_online to match expected output.")
 
         # Test 4: Reward is positive
         total += 1
