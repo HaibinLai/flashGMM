@@ -119,6 +119,14 @@ __global__ void flash_log_normalizer_v2_kernel(
         for (int pt = warp_id; pt < BN_actual; pt += n_warps) {
             int n = block_start + pt;
 
+            // Cache X in registers — avoid repeated global memory reads
+            float x_local[MAX_DIMS_PER_LANE];
+            #pragma unroll
+            for (int i = 0; i < MAX_DIMS_PER_LANE; i++) {
+                int j = lane_id + i * 32;
+                x_local[i] = (j < d) ? X[n * d + j] : 0.0f;
+            }
+
             float rm = __shfl_sync(0xffffffff,
                            (lane_id == 0) ? max_smem[pt] : 0.0f, 0);
             float rs = __shfl_sync(0xffffffff,
@@ -130,7 +138,7 @@ __global__ void flash_log_normalizer_v2_kernel(
                 for (int i = 0; i < MAX_DIMS_PER_LANE; i++) {
                     int j = lane_id + i * 32;
                     if (j < d) {
-                        float diff = X[n * d + j] - mu_tile[kk * d + j];
+                        float diff = x_local[i] - mu_tile[kk * d + j];
                         partial += diff * diff * iv_tile[kk * d + j];
                     }
                 }
