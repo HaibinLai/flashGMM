@@ -555,3 +555,242 @@ EXAMPLES.update({
         "default_params": {"N": 4096, "d": 128, "BN": 64},
     },
 })
+
+
+# ============================================================================
+# 1D FFT (radix-2 Cooley-Tukey)
+# ============================================================================
+
+def fft_baseline() -> ComputationGraph:
+    """
+    Standard 1D FFT: log2(N) butterfly passes, each materializing a full N-length
+    complex buffer to HBM.  Total IO = O(N * log N) reads + writes.
+    """
+    return ComputationGraph(
+        name="fft_standard",
+        description="Radix-2 Cooley-Tukey FFT with per-stage HBM materialization",
+        inputs={
+            "x_re": TensorSpec(shape=("N",), dtype="f32"),
+            "x_im": TensorSpec(shape=("N",), dtype="f32"),
+        },
+        operations=[
+            Op(name="bit_reversal",
+               reads=["x_re", "x_im"],
+               computes="permutation",
+               flops_fn=lambda p: p["N"],
+               output=TensorSpec(shape=("N",), dtype="f32", storage="HBM"),
+               output_name="buf_re",
+               notes="Bit-reversal permutation, write reordered buffer to HBM"),
+
+            Op(name="butterfly_passes",
+               reads=["buf_re"],
+               computes="butterfly_log_n",
+               # log2(N) passes, each reading+writing 2N floats (re+im)
+               # Model total IO as writing log2N copies of the buffer
+               flops_fn=lambda p: int(p["N"] * p["log2N"] * 10),
+               output=TensorSpec(shape=("log2N", "N"), dtype="f32", storage="HBM"),
+               output_name="stage_buffers",
+               notes="log2(N) butterfly passes; each pass reads/writes full N-complex buffer to HBM. "
+                     "Total HBM IO: log2(N) × 2 × N × 4 bytes."),
+
+            Op(name="extract_output",
+               reads=["stage_buffers"],
+               computes="copy",
+               flops_fn=lambda p: p["N"],
+               output=TensorSpec(shape=("N",), dtype="f32", storage="HBM"),
+               output_name="Y_re"),
+        ],
+        outputs=["Y_re"],
+    )
+
+
+def fft_flash() -> ComputationGraph:
+    """
+    Flash FFT: fuse log2(BN) butterfly stages within SMEM tile.
+    Each tile processes log2(BN) stages on-chip before writing back.
+    Only (log2N - log2BN) global stages need HBM round-trips.
+    """
+    return ComputationGraph(
+        name="fft_flash",
+        description="Flash FFT: fuse log2(BN) butterfly stages in SMEM per tile",
+        inputs={
+            "x_re": TensorSpec(shape=("N",), dtype="f32"),
+            "x_im": TensorSpec(shape=("N",), dtype="f32"),
+        },
+        operations=[
+            FusedOp(
+                name="flash_fft",
+                reads=["x_re", "x_im"],
+                computes="bit_reversal+butterfly[fused_stages]",
+                flops_fn=lambda p: int(p["N"] * p["log2N"] * 10),
+                output=TensorSpec(shape=("N",), dtype="f32", storage="HBM"),
+                output_name="Y_re",
+                tiling=TilingSpec(tiles={"N": "BN"}),
+                notes="Fuse log2(BN)=10 stages in SMEM. Only (log2N - log2BN) = 10 global stages "
+                      "need HBM round-trips (vs 20 for standard). ~50% IO reduction.",
+            ),
+        ],
+        outputs=["Y_re"],
+    )
+
+
+# ============================================================================
+# Conv2D (im2col + GEMM approach)
+# ============================================================================
+
+def conv2d_baseline() -> ComputationGraph:
+    """
+    Standard Conv2D via im2col: unfold input → GEMM → output.
+    im2col materializes a huge (N*OH*OW, C_in*KH*KW) matrix.
+    """
+    return ComputationGraph(
+        name="conv2d_standard",
+        description="Conv2D via im2col + GEMM with materialized unfolded matrix",
+        inputs={
+            "input": TensorSpec(shape=("N", "C_in", "H", "W"), dtype="f32"),
+            "weight": TensorSpec(shape=("C_out", "C_in", "KH", "KW"), dtype="f32"),
+        },
+        operations=[
+            Op(name="im2col",
+               reads=["input"],
+               computes="unfold",
+               flops_fn=lambda p: p["N"] * p["OH"] * p["OW"] * p["C_in"] * p["KH"] * p["KW"],
+               output=TensorSpec(shape=("N_OH_OW", "C_in_KH_KW"), dtype="f32", storage="HBM"),
+               output_name="col_matrix",
+               notes="Materialize unfolded matrix: (N*OH*OW) × (C_in*KH*KW). "
+                     "For N=64, C=128, H=W=56, K=3: 12.8M × 1152 = 56 GB!"),
+
+            Op(name="gemm",
+               reads=["col_matrix", "weight"],
+               computes="matmul",
+               flops_fn=lambda p: 2 * p["N"] * p["OH"] * p["OW"] * p["C_out"] * p["C_in"] * p["KH"] * p["KW"],
+               output=TensorSpec(shape=("N", "C_out", "OH", "OW"), dtype="f32", storage="HBM"),
+               output_name="output",
+               notes="GEMM on unfolded matrix"),
+        ],
+        outputs=["output"],
+    )
+
+
+def conv2d_flash() -> ComputationGraph:
+    """
+    Flash Conv2D: implicit im2col fused with GEMM.
+    Compute im2col on-the-fly in SMEM, never materialize to HBM.
+    """
+    return ComputationGraph(
+        name="conv2d_flash",
+        description="Flash Conv2D: implicit im2col fused with GEMM, zero unfolded matrix",
+        inputs={
+            "input": TensorSpec(shape=("N", "C_in", "H", "W"), dtype="f32"),
+            "weight": TensorSpec(shape=("C_out", "C_in", "KH", "KW"), dtype="f32"),
+        },
+        operations=[
+            FusedOp(
+                name="flash_conv2d",
+                reads=["input", "weight"],
+                computes="implicit_im2col+gemm",
+                flops_fn=lambda p: 2 * p["N"] * p["OH"] * p["OW"] * p["C_out"] * p["C_in"] * p["KH"] * p["KW"],
+                output=TensorSpec(shape=("N", "C_out", "OH", "OW"), dtype="f32", storage="HBM"),
+                output_name="output",
+                tiling=TilingSpec(tiles={"N_OH_OW": "BM", "C_out": "BN", "C_in_KH_KW": "BK"}),
+                notes="Implicit im2col: gather input patches into SMEM on-the-fly, "
+                      "then GEMM tile against weight. col_matrix never in HBM.",
+            ),
+        ],
+        outputs=["output"],
+    )
+
+
+# ============================================================================
+# 2D Stencil (Jacobi iteration)
+# ============================================================================
+
+def stencil2d_baseline() -> ComputationGraph:
+    """
+    Standard 2D 5-point Jacobi stencil: each of T iterations reads H×W grid
+    and writes H×W output to HBM. Total IO = T × 2 × H × W × 4 bytes.
+    Model this as: grid → T iterations of intermediate buffers → grid_out.
+    """
+    return ComputationGraph(
+        name="stencil2d_standard",
+        description="2D Jacobi stencil: T iterations, each materializes full H×W grid",
+        inputs={
+            "grid": TensorSpec(shape=("H", "W"), dtype="f32"),
+        },
+        operations=[
+            Op(name="stencil_iterations",
+               reads=["grid"],
+               computes="jacobi_5pt",
+               # T iterations, each doing 5 FLOPs per cell
+               flops_fn=lambda p: p["T"] * p["H"] * p["W"] * 5,
+               # Model total materialization: T copies of H×W (T HBM round-trips)
+               output=TensorSpec(shape=("T", "H", "W"), dtype="f32", storage="HBM"),
+               output_name="iter_buffers",
+               notes="T iterations, each reads + writes full H×W grid. "
+                     "Intermediate shape (T,H,W) models total materialization."),
+
+            Op(name="extract_final",
+               reads=["iter_buffers"],
+               computes="copy",
+               flops_fn=lambda p: p["H"] * p["W"],
+               output=TensorSpec(shape=("H", "W"), dtype="f32", storage="HBM"),
+               output_name="grid_out"),
+        ],
+        outputs=["grid_out"],
+    )
+
+
+def stencil2d_flash() -> ComputationGraph:
+    """
+    Flash 2D Stencil: temporal tiling — fuse S iterations within SMEM tile.
+    Each tile loads (BH+2S) × (BW+2S) halo region once, applies S iterations
+    on-chip, writes back BH×BW output.
+    Total HBM IO: ceil(T/S) × H×W + halo overhead, instead of T × H×W.
+    """
+    return ComputationGraph(
+        name="stencil2d_flash",
+        description="Flash stencil: temporal tiling, fuse S iterations in SMEM",
+        inputs={
+            "grid": TensorSpec(shape=("H", "W"), dtype="f32"),
+        },
+        operations=[
+            FusedOp(
+                name="flash_stencil",
+                reads=["grid"],
+                computes="jacobi_5pt[temporal_tiling]",
+                flops_fn=lambda p: p["T"] * p["H"] * p["W"] * 5,
+                output=TensorSpec(shape=("H", "W"), dtype="f32", storage="HBM"),
+                output_name="grid_out",
+                tiling=TilingSpec(tiles={"H": "BH", "W": "BW", "T": "S"}),
+                notes="Temporal tiling: fuse S iterations per tile. "
+                      "IO: ceil(T/S) × H×W reads + writes (S× fewer HBM round-trips). "
+                      "No intermediate grids materialized.",
+            ),
+        ],
+        outputs=["grid_out"],
+    )
+
+
+# Update registry with new operators
+EXAMPLES.update({
+    "fft": {
+        "baseline": fft_baseline,
+        "flash": fft_flash,
+        "default_params": {"N": 1048576, "log2N": 20, "BN": 1024},
+    },
+    "conv2d": {
+        "baseline": conv2d_baseline,
+        "flash": conv2d_flash,
+        "default_params": {
+            "N": 64, "C_in": 128, "C_out": 256, "H": 56, "W": 56,
+            "KH": 3, "KW": 3, "OH": 56, "OW": 56,
+            "N_OH_OW": 64 * 56 * 56, "C_in_KH_KW": 128 * 3 * 3,
+            "BM": 128, "BN": 128, "BK": 32,
+        },
+    },
+    "stencil2d": {
+        "baseline": stencil2d_baseline,
+        "flash": stencil2d_flash,
+        "default_params": {"H": 4096, "W": 4096, "T": 100, "BH": 64, "BW": 64, "S": 8},
+    },
+})

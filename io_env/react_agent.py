@@ -125,6 +125,31 @@ TOOLS = {
         "parameters": {},
         "example": '{"tool": "autotune_kernel", "args": {}}',
     },
+    "pre_check": {
+        "description": "Run multi-dimensional pre-optimization checklist BEFORE optimizing. Checks: (1) memory-bound vs compute-bound, (2) data vs L2 cache size, (3) GEMM structure that must be preserved, (4) atomic contention risk. Returns GO/CAUTION recommendation.",
+        "parameters": {},
+        "example": '{"tool": "pre_check", "args": {}}',
+    },
+    "ncu_profile": {
+        "description": "Runtime-profile the current kernel. Returns: bandwidth utilization %, compute utilization %, Tensor Core usage, roofline bottleneck classification (memory-bound / compute-bound / under-utilized). Use this AFTER benchmark_kernel shows slow performance to diagnose WHY.",
+        "parameters": {},
+        "example": '{"tool": "ncu_profile", "args": {}}',
+    },
+    "library_ceiling": {
+        "description": "Benchmark the library-optimized implementation (cuDNN/cuFFT/cuBLAS/ATen) as a performance ceiling. Shows how far your kernel is from the best possible library implementation. Use to decide whether further optimization is worthwhile.",
+        "parameters": {},
+        "example": '{"tool": "library_ceiling", "args": {}}',
+    },
+    "compare_profile": {
+        "description": "Profile baseline (materialized) and flash kernel side-by-side. Shows bandwidth util, compute util, Tensor Core usage, and roofline bottleneck for BOTH. Highlights the biggest performance difference to pinpoint the root cause.",
+        "parameters": {},
+        "example": '{"tool": "compare_profile", "args": {}}',
+    },
+    "occupancy_analysis": {
+        "description": "Estimate kernel occupancy from block size, num_warps, register/SMEM usage. Low occupancy (< 25%) means SM is mostly idle — adjust BLOCK_SIZE or reduce register pressure.",
+        "parameters": {},
+        "example": '{"tool": "occupancy_analysis", "args": {}}',
+    },
 }
 
 
@@ -211,6 +236,8 @@ class IOEnvironment:
             for name, info in TOOLS.items()
         )
 
+        hw_l2 = self.calc.hw.l2_cache_mb
+
         prompt = f"""You are a GPU kernel optimization agent that writes REAL Triton/CUDA kernels.
 
 Your goal: reduce HBM memory traffic (IO) by eliminating intermediate matrix materialization,
@@ -219,27 +246,55 @@ then generate an ACTUAL Triton GPU kernel that achieves real speedup.
 ## Available Tools
 {tool_desc}
 
+## Pre-Optimization Checklist (MUST run before optimizing)
+
+After 'analyze', ALWAYS run 'pre_check' to verify these conditions:
+
+1. Is the operator MEMORY-BOUND? (AI < balance point)
+   - If compute-bound, IO optimization may not help wall-clock time.
+   - Focus on compute efficiency (Tensor Core, parallelism) instead.
+
+2. Does the intermediate data exceed L2 cache? (data_size > {hw_l2}MB)
+   - If data fits in L2, full scans may be cheaper than clever reductions.
+   - IO analysis overestimates actual HBM traffic when data is cached.
+
+3. Will the optimization PRESERVE compute parallelism?
+   - NEVER replace a GEMM (tl.dot/cuBLAS) with a scalar loop.
+   - Use: tiled GEMM + online reduce.
+   - Losing Tensor Core → 10-50× slowdown.
+
+4. Does the optimization introduce atomic operations?
+   - Atomics on hot addresses serialize execution.
+   - Prefer: local accumulation → one global write per block.
+
+If pre_check says CAUTION, consider whether IO optimization is the right approach.
+
 ## Required Workflow
-Phase 1 — Symbolic IO Analysis:
+Phase 0 — Pre-Check:
 1. 'analyze' the baseline operator's IO bottlenecks
-2. Apply optimizations (fuse_and_online, fuse_ops) to eliminate materialized intermediates
-3. 'verify' the symbolic optimization
+2. 'pre_check' to verify IO optimization is appropriate
+   - If CAUTION: consider alternatives or proceed with care
+
+Phase 1 — Symbolic IO Analysis:
+3. Apply optimizations (fuse_and_online, fuse_ops) to eliminate materialized intermediates
+4. 'verify' the symbolic optimization
 
 Phase 2 — Kernel Generation + Testing (THE REAL DELIVERABLE):
-4. 'generate_kernel' to create a Triton or CUDA GPU kernel
+5. 'generate_kernel' to create a Triton or CUDA GPU kernel
    - Default: use template if available. Otherwise write your own with custom_code.
    - For Triton: @triton.jit kernel with tl.load, tl.store, tl.dot, tl.arange.
    - For CUDA: C++ with __global__ kernels + PYBIND11_MODULE. Set lang='cuda'.
    - DO NOT just call PyTorch ops — write actual GPU kernel code.
-5. 'compile_and_test' to verify correctness against PyTorch reference
-6. 'benchmark_kernel' to measure ACTUAL speedup vs materialized baseline
+6. 'compile_and_test' to verify correctness against PyTorch reference
+7. 'benchmark_kernel' to measure ACTUAL speedup vs materialized baseline
 
 Phase 3 — Iterate if Needed:
-7. If speedup < 1.0×, analyze WHY:
-   - Per-row serial loop vs GEMM parallelism?
-   - Poor memory access pattern?
-   - Not enough parallelism in the Triton kernel?
-8. Write an IMPROVED kernel using 'generate_kernel' with custom_code=<your new Triton code>
+8. If speedup < 1.0×, use 'profile_kernel' to diagnose WHY:
+   - No Tensor Core? → add tl.dot (retrieve_pattern 'gemm_online_reduce')
+   - High atomic contention? → local accumulation
+   - Low occupancy? → adjust BLOCK_SIZE
+   - Poor coalescing? → fix access pattern
+9. Write an IMPROVED kernel using 'generate_kernel' with custom_code=<your new Triton code>
    - The custom_code must be a complete Python module with:
      * import torch, triton, triton.language as tl
      * A @triton.jit kernel function
@@ -258,11 +313,33 @@ Phase 3 — Iterate if Needed:
      * Using scalar loops inside @triton.jit (use tl.arange + vectorized ops)
      * Small BLOCK_SIZE (< 128) causing low memory bandwidth utilization
 9. Repeat compile_and_test + benchmark_kernel until speedup >= 1.0×
+10. Use 'autotune_kernel' to sweep block sizes for the best configuration
+
+Phase 3 — Diagnose Slow Kernels (DATA-DRIVEN):
+If benchmark_kernel shows speedup < 1.0×, DO NOT guess — use profiling tools:
+11. 'ncu_profile' → get runtime metrics: bandwidth util %, compute util %, Tensor Core usage
+12. 'library_ceiling' → see performance gap vs cuDNN/cuFFT/cuBLAS
+13. 'compare_profile' → see what changed vs baseline (side-by-side)
+14. 'occupancy_analysis' → check if occupancy is limiting performance
+
+Decision tree based on profiling results:
+  - bandwidth_util < 30% AND compute_util < 10% → STRUCTURAL PROBLEM
+    (wrong parallelism pattern, scalar loops instead of GEMM)
+    → 'retrieve_pattern' to learn correct pattern, then rewrite kernel
+  - bandwidth_util > 70% → MEMORY-BOUND, IO optimization working well
+    → 'autotune_kernel' for final tuning, then 'done'
+  - compute_util > 40% but no Tensor Core → MISSING TENSOR CORE
+    → add tl.dot, retrieve_pattern 'gemm_online_reduce'
+  - library_gap > 5× → GAP TOO LARGE for hand-written kernel
+    → accept result, call 'done', explain why library is better
 
 ## RULES
+- You MUST run 'pre_check' after 'analyze' before applying optimizations.
 - You MUST write Triton kernel code. DO NOT generate Python-only solutions.
 - You MUST achieve speedup >= 1.0× or explain clearly why it's not possible.
-- After benchmark_kernel, if speedup < 1.0×, you MUST try to improve the kernel.
+- After benchmark_kernel, if speedup < 1.0×, ALWAYS call 'ncu_profile' before rewriting.
+- If pre_check warns about GEMM structure, you MUST use tl.dot in your kernel.
+- Use 'library_ceiling' to know when to stop optimizing (within 2× of library = good enough).
 
 ## Response Format
 Thought: <your reasoning>
@@ -301,6 +378,16 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
             return self._tool_retrieve_pattern(args)
         elif tool == "autotune_kernel":
             return self._tool_autotune_kernel(args)
+        elif tool == "pre_check":
+            return self._tool_pre_check(args)
+        elif tool == "ncu_profile":
+            return self._tool_ncu_profile(args)
+        elif tool == "library_ceiling":
+            return self._tool_library_ceiling(args)
+        elif tool == "compare_profile":
+            return self._tool_compare_profile(args)
+        elif tool == "occupancy_analysis":
+            return self._tool_occupancy_analysis(args)
         elif tool == "done":
             return self._tool_done()
         else:
@@ -479,6 +566,32 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
             else:
                 lines.append(f"  ⚠ Flash is slower ({speedup:.2f}×) — may need kernel-level optimization")
 
+            # 3-way comparison: library (cuDNN/cuFFT) if available
+            library_fn = benchmarks.get("library")
+            if library_fn is not None:
+                lib_name = benchmarks.get("library_name", "Library")
+                try:
+                    for _ in range(n_warmup):
+                        library_fn(tensors)
+                    torch.cuda.synchronize()
+
+                    s.record()
+                    for _ in range(n_iter):
+                        library_fn(tensors)
+                    e.record()
+                    torch.cuda.synchronize()
+                    t_lib = s.elapsed_time(e) / n_iter
+
+                    speedup_vs_lib = t_lib / t_flash if t_flash > 0 else 0
+                    speedup_lib_vs_mat = t_baseline / t_lib if t_lib > 0 else 0
+
+                    lines.append(f"  ── {lib_name} comparison ──")
+                    lines.append(f"  {lib_name}:                   {t_lib:.3f} ms")
+                    lines.append(f"  {lib_name} vs materialized:   {speedup_lib_vs_mat:.2f}×")
+                    lines.append(f"  Flash vs {lib_name}:          {speedup_vs_lib:.2f}×")
+                except Exception as lib_ex:
+                    lines.append(f"  {lib_name} benchmark skipped: {lib_ex}")
+
             obs = "\n".join(lines)
             reward = 2.0 * (speedup - 1.0)  # bonus for actual speedup
             return obs, max(reward, 0.0), False
@@ -544,7 +657,8 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
             with open(filepath) as f:
                 code = f.read()
             obs += "\n\n=== CURRENT KERNEL CODE (needs improvement) ===\n" + code
-            obs += "\n\nHINT: Use 'profile_kernel' to diagnose WHY it's slow, then 'retrieve_pattern' to learn HOW to fix it."
+            obs += "\n\nHINT: Use 'ncu_profile' for runtime metrics (bandwidth/compute utilization), "
+            obs += "'library_ceiling' for performance ceiling, or 'compare_profile' for side-by-side diagnosis."
         return obs, max(reward, 0.0), False
 
     def _tool_profile_kernel(self, args: dict) -> tuple[str, float, bool]:
@@ -571,6 +685,17 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
         num_tl_store = code.count("tl.store")
         has_online = "running" in code or "best_" in code or "float(\"-inf\")" in code or "float('-inf')" in code
 
+        # Dim 5: Atomic operation detection
+        num_atomic_add = code.count("tl.atomic_add") + code.count("atomicAdd")
+        num_atomic_cas = code.count("tl.atomic_cas") + code.count("atomicCAS")
+        num_atomic_max = code.count("tl.atomic_max") + code.count("atomicMax")
+        total_atomics = num_atomic_add + num_atomic_cas + num_atomic_max
+
+        # Dim 7: Memory coalescing analysis
+        # Check for indirect indexing patterns (poor coalescing)
+        has_indirect_idx = bool(re.search(r'tl\.load\([^)]*\[[^\]]*\]', code))
+        has_gather = "gather" in code.lower()
+
         # Count loop depth
         import re
         for_loops = re.findall(r'for \w+ in range\(.*?\)', code)
@@ -579,10 +704,21 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
         lines.append(f"  tl.dot (Tensor Core GEMM): {'YES ✓' if has_tl_dot else 'NO ✗ — NOT using Tensor Cores!'}")
         lines.append(f"  tl.load calls: {num_tl_load}")
         lines.append(f"  tl.store calls: {num_tl_store}")
+        lines.append(f"  Atomic operations: {total_atomics}" +
+                     (f" ⚠ ({num_atomic_add} add, {num_atomic_cas} cas, {num_atomic_max} max)" if total_atomics > 0 else " ✓"))
+        lines.append(f"  Indirect indexing: {'YES ⚠ (may hurt coalescing)' if has_indirect_idx or has_gather else 'NO ✓'}")
         lines.append(f"  For loops in kernel: {len(for_loops)}")
         for i, fl in enumerate(for_loops):
             lines.append(f"    loop {i}: {fl}")
         lines.append(f"  Online/streaming pattern: {'YES' if has_online else 'NO'}")
+
+        # --- Dim 3: Cache analysis ---
+        if self.current_report and self.current_report.pre_check:
+            pc = self.current_report.pre_check
+            lines.append(f"\n--- Cache & Bottleneck Context ---")
+            lines.append(f"  Memory-bound: {'YES' if pc.is_memory_bound else 'NO (compute-bound)'}")
+            lines.append(f"  Data fits L2: {'YES ⚠' if pc.data_fits_l2 else 'NO ✓ (IO analysis trustworthy)'}")
+            lines.append(f"  GEMM structure: {'YES — must use tl.dot' if pc.has_gemm_structure else 'NO'}")
 
         # Compute theoretical metrics
         lines.append(f"\n--- Performance Diagnosis ---")
@@ -619,6 +755,20 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
             lines.append(f"  2. Process centroid tiles (BK=32-64), not one centroid at a time")
             lines.append(f"  3. Apply online argmin across tiles (keep running_min per row)")
             lines.append(f"  4. Call 'retrieve_pattern' with 'gemm_online_reduce' for example code")
+
+        # Dim 5: Atomic contention recommendations
+        if total_atomics > 0:
+            lines.append(f"  ⚠ ATOMIC CONTENTION: {total_atomics} atomic ops found.")
+            lines.append(f"    Atomics on hot addresses serialize warp execution.")
+            lines.append(f"    FIX: Accumulate in registers/SMEM per block → single tl.store at end.")
+            if num_atomic_cas > 0:
+                lines.append(f"    atomicCAS is especially expensive — consider warp-level vote + one CAS per warp.")
+
+        # Dim 7: Coalescing recommendations
+        if has_indirect_idx or has_gather:
+            lines.append(f"  ⚠ POOR COALESCING: Indirect/gather memory access detected.")
+            lines.append(f"    Non-contiguous addresses → bandwidth utilization < 25%.")
+            lines.append(f"    FIX: Reorganize data layout or use tiled access with contiguous loads.")
 
         return "\n".join(lines), 0.0, False
 
@@ -727,6 +877,226 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
         obs = "\n".join(lines)
         reward = 3.0 * (best_speedup - 1.0) if best_speedup > 1.0 else 0.0
         return obs, reward, False
+
+    def _tool_pre_check(self, args: dict) -> tuple[str, float, bool]:
+        """Run multi-dimensional pre-optimization checklist."""
+        if not self.current_report:
+            return "No analysis loaded. Use 'analyze' first.", 0.0, False
+
+        pc = self.current_report.pre_check
+        if not pc:
+            return "Pre-check not available (report may be stale).", 0.0, False
+
+        lines = [pc.display()]
+
+        # Add task-specific guidance based on the checklist
+        if not pc.io_optimization_recommended:
+            lines.append("\n⚠ IO optimization is NOT recommended for this operator.")
+            lines.append("  Consider alternative approaches:")
+            if not pc.is_memory_bound:
+                lines.append("  - Focus on compute optimization (Tensor Core utilization, parallelism)")
+            if pc.data_fits_l2:
+                lines.append("  - Data fits in L2 cache; improve access patterns instead of reducing IO")
+        else:
+            lines.append("\n✓ IO optimization is recommended.")
+            if pc.has_gemm_structure:
+                lines.append("  ⚠ CRITICAL: Preserve GEMM structure! Use tl.dot for inner products.")
+                lines.append("  Pattern: tile GEMM + online reduce (retrieve_pattern 'gemm_online_reduce')")
+            if pc.data_fits_l2:
+                lines.append("  Note: Some intermediates fit L2 — expect smaller speedup than IO reduction suggests.")
+
+        obs = "\n".join(lines)
+        return obs, 0.0, False
+
+    def _tool_ncu_profile(self, args: dict) -> tuple[str, float, bool]:
+        """Runtime-profile the current kernel: bandwidth/compute utilization, TC usage."""
+        from io_env.profiler import runtime_profile, ncu_profile, _has_ncu
+        filepath = getattr(self, '_kernel_path', None)
+        if not filepath or not os.path.exists(filepath):
+            return "No kernel to profile. Run generate_kernel first.", 0.0, False
+
+        try:
+            result = runtime_profile(self.task_name, self.params, filepath)
+        except Exception as e:
+            return f"Profile error: {e}\n{traceback.format_exc()}", 0.0, False
+
+        lines = [result.display(self.task_name)]
+
+        # Try ncu for hardware counter data
+        if _has_ncu():
+            lines.append("\n--- NCU Hardware Counters ---")
+            try:
+                ncu_out = ncu_profile(self.task_name, self.params, filepath)
+                if ncu_out:
+                    if "permission denied" in ncu_out.lower() or "ERR_NVGPUCTRPERM" in ncu_out:
+                        lines.append(f"  {ncu_out.split(chr(10))[0]}")
+                        lines.append("  Using torch.profiler estimates above instead.")
+                    else:
+                        # Extract key metrics from ncu output
+                        for metric_line in ncu_out.split("\n"):
+                            ml = metric_line.strip()
+                            if any(k in ml for k in ("dram__", "sm__", "gpu__time",
+                                                       "Metric Name", "Metric Unit", "----")):
+                                lines.append(f"  {ml[:85]}")
+                        if not any("dram__" in l or "sm__" in l for l in lines[-10:]):
+                            lines.append("  (ncu ran but no matching metrics found)")
+                else:
+                    lines.append("  (ncu returned no data)")
+            except Exception as e:
+                lines.append(f"  (ncu failed: {e})")
+        else:
+            lines.append("\n(ncu not available — using torch.profiler estimates)")
+
+        # Actionable recommendations
+        lines.append("\n--- Diagnosis ---")
+        if result.roofline_bottleneck == "under-utilized":
+            lines.append("⚠ UNDER-UTILIZED: Both bandwidth and compute are low.")
+            lines.append("  This means a structural parallelism problem (not IO or compute).")
+            lines.append("  Common causes: scalar loops instead of GEMM, low occupancy, poor coalescing.")
+            lines.append("  → Call 'compare_profile' to see what changed vs baseline.")
+        elif result.roofline_bottleneck == "memory-bound":
+            lines.append("✓ Memory-bound with good bandwidth utilization.")
+            lines.append("  IO optimization is working. Further gains via larger BLOCK_SIZE or autotune.")
+        elif result.roofline_bottleneck == "compute-bound":
+            lines.append("Compute-bound kernel. IO optimization won't help further.")
+            if not result.uses_tensor_core:
+                lines.append("  ⚠ NOT using Tensor Core — add tl.dot for Tensor Core GEMM!")
+                lines.append("  → Call 'retrieve_pattern' with 'gemm_online_reduce'.")
+            else:
+                lines.append("  ✓ Using Tensor Core. Consider algorithmic improvement or accept.")
+        if result.tensor_core_hint:
+            lines.append(f"  TC detail: {result.tensor_core_hint}")
+        if result.kernel_names:
+            lines.append(f"  CUDA kernels: {', '.join(result.kernel_names[:3])}")
+
+        return "\n".join(lines), 0.0, False
+
+    def _tool_library_ceiling(self, args: dict) -> tuple[str, float, bool]:
+        """Benchmark library (cuDNN/cuFFT/cuBLAS) as performance ceiling."""
+        from io_env.profiler import library_ceiling, runtime_profile
+        filepath = getattr(self, '_kernel_path', None)
+
+        try:
+            lib_info = library_ceiling(self.task_name, self.params)
+        except Exception as e:
+            return f"Library ceiling error: {e}", 0.0, False
+
+        if "error" in lib_info:
+            return lib_info["error"], 0.0, False
+
+        lib_name = lib_info["library_name"]
+        lib_time = lib_info["library_time_ms"]
+
+        # Also time our kernel for comparison
+        flash_time = 0.0
+        if filepath and os.path.exists(filepath):
+            try:
+                result = runtime_profile(self.task_name, self.params, filepath, n_iter=10)
+                flash_time = result.kernel_time_ms
+            except Exception:
+                pass
+
+        lines = [
+            f"=== Library Ceiling: {self.task_name} ===",
+            f"  {lib_name}: {lib_time:.3f} ms",
+        ]
+
+        if flash_time > 0:
+            gap = flash_time / lib_time if lib_time > 0 else float("inf")
+            lines.append(f"  Flash kernel: {flash_time:.3f} ms")
+            lines.append(f"  Gap: Flash is {gap:.1f}× slower than {lib_name}")
+            lines.append("")
+            if gap > 10:
+                lines.append(f"⚠ Gap > 10×: Your kernel has fundamental efficiency problems.")
+                lines.append(f"  Consider: missing Tensor Core, poor parallelism, wrong algorithm.")
+                lines.append(f"  → Call 'ncu_profile' to diagnose, or accept library as solution.")
+            elif gap > 3:
+                lines.append(f"⚠ Gap 3-10×: Significant room for improvement.")
+                lines.append(f"  → Call 'ncu_profile' to identify bottleneck.")
+            elif gap > 1.5:
+                lines.append(f"△ Gap 1.5-3×: Some room for improvement via tuning.")
+                lines.append(f"  → Try 'autotune_kernel' to sweep block sizes.")
+            else:
+                lines.append(f"✓ Within 1.5× of {lib_name} — near optimal!")
+                lines.append(f"  Consider calling 'done'.")
+        else:
+            lines.append(f"  (No flash kernel available for comparison)")
+
+        if lib_time == float("inf"):
+            lines.append(f"  Note: No standard library for this operation.")
+
+        return "\n".join(lines), 0.0, False
+
+    def _tool_compare_profile(self, args: dict) -> tuple[str, float, bool]:
+        """Side-by-side profile: baseline vs flash (vs library)."""
+        from io_env.profiler import compare_profile
+        filepath = getattr(self, '_kernel_path', None)
+        if not filepath or not os.path.exists(filepath):
+            return "No kernel to compare. Run generate_kernel first.", 0.0, False
+
+        try:
+            result = compare_profile(self.task_name, self.params, filepath)
+        except Exception as e:
+            return f"Compare error: {e}\n{traceback.format_exc()}", 0.0, False
+
+        lines = [result.display()]
+
+        # Actionable summary
+        b, f = result.baseline, result.flash
+        lines.append("\n--- Root Cause Analysis ---")
+        if b.compute_utilization_pct > 30 and f.compute_utilization_pct < 10:
+            lines.append("⚠ Baseline has {:.0f}% compute utilization, Flash only {:.0f}%.".format(
+                b.compute_utilization_pct, f.compute_utilization_pct))
+            lines.append("  → Flash kernel lost compute parallelism (likely dropped Tensor Core / GEMM).")
+        if b.bandwidth_utilization_pct > 50 and f.bandwidth_utilization_pct < 20:
+            lines.append("⚠ Baseline bandwidth {:.0f}%, Flash only {:.0f}%.".format(
+                b.bandwidth_utilization_pct, f.bandwidth_utilization_pct))
+            lines.append("  → Flash kernel has poor memory access patterns (indirect indexing? small blocks?).")
+        if f.bandwidth_utilization_pct > 70:
+            lines.append("✓ Flash kernel bandwidth utilization is {:.0f}% — good.".format(f.bandwidth_utilization_pct))
+            lines.append("  IO optimization is effective. Further gains limited by HBM bandwidth.")
+
+        return "\n".join(lines), 0.0, False
+
+    def _tool_occupancy_analysis(self, args: dict) -> tuple[str, float, bool]:
+        """Estimate kernel occupancy from code analysis."""
+        from io_env.profiler import estimate_occupancy
+        filepath = getattr(self, '_kernel_path', None)
+        if not filepath or not os.path.exists(filepath):
+            return "No kernel to analyze. Run generate_kernel first.", 0.0, False
+
+        with open(filepath) as f:
+            code = f.read()
+
+        occ = estimate_occupancy(code)
+
+        lines = [
+            f"=== Occupancy Analysis: {self.task_name} ===",
+            f"  Block size:       {occ['block_size']}",
+            f"  Num warps:        {occ['num_warps']} ({occ['threads_per_block']} threads/block)",
+            f"  Est. registers:   {occ['est_registers_per_thread']}/thread",
+            f"  Est. SMEM:        {occ['est_smem_bytes']/1024:.1f} KB/block",
+            f"  Active blocks/SM: {occ['active_blocks_per_sm']}",
+            f"  Active warps/SM:  {occ['active_warps_per_sm']}/{occ['max_warps_per_sm']}",
+            f"  Occupancy:        {occ['occupancy_pct']:.0f}%",
+            f"  Limiting factor:  {occ['limiting_factor']}",
+        ]
+
+        if occ['occupancy_pct'] < 25:
+            lines.append(f"\n⚠ LOW OCCUPANCY ({occ['occupancy_pct']:.0f}%): SM is mostly idle.")
+            lines.append(f"  Limited by: {occ['limiting_factor']}")
+            if occ['limiting_factor'] == 'registers':
+                lines.append(f"  Fix: Reduce register pressure — smaller BLOCK_SIZE or fewer accumulators.")
+            elif occ['limiting_factor'] == 'shared_memory':
+                lines.append(f"  Fix: Reduce SMEM usage — smaller tile sizes.")
+            elif occ['limiting_factor'] == 'threads':
+                lines.append(f"  Fix: Use fewer warps per block (num_warps=4 instead of 8).")
+        elif occ['occupancy_pct'] < 50:
+            lines.append(f"\n△ MODERATE OCCUPANCY ({occ['occupancy_pct']:.0f}%): acceptable but not ideal.")
+        else:
+            lines.append(f"\n✓ GOOD OCCUPANCY ({occ['occupancy_pct']:.0f}%): SM well-utilized.")
+
+        return "\n".join(lines), 0.0, False
 
     def _tool_done(self) -> tuple[str, float, bool]:
         reward = compute_reward(self.baseline_report, self.current_report)
@@ -965,6 +1335,83 @@ def _reduce_stats(X, MEAN, VAR, N: tl.constexpr, D: tl.constexpr, BD: tl.constex
     tl.store(VAR + d_offs, var, mask=d_mask)
 ''',
     },
+
+    "fft_temporal_blocking": {
+        "keywords": ["fft", "butterfly", "temporal", "blocking", "radix", "cooley"],
+        "when": "FFT has log2(N) butterfly stages, each requiring an HBM round-trip. For large N this is IO-bound.",
+        "wrong": "Naively launch one kernel per stage → log2(N) HBM reads+writes of full array.",
+        "right": "Block the array into tiles of size B. Fuse log2(B) local stages in SMEM (zero HBM traffic). Only log2(N)-log2(B) global stages need HBM. This is temporal blocking / register blocking for FFT.",
+        "code": '''
+// Flash FFT kernel: fuse log2(TILE) stages in shared memory
+template <int TILE>
+__global__ void flash_fft_tile(float* re, float* im, int N, int log2_tile) {
+    extern __shared__ float smem[];
+    float* s_re = smem; float* s_im = smem + TILE;
+    int base = blockIdx.x * TILE;
+    // Load tile from HBM → SMEM (1 read)
+    for (int i = threadIdx.x; i < TILE; i += blockDim.x) {
+        s_re[i] = re[base + i]; s_im[i] = im[base + i];
+    }
+    __syncthreads();
+    // log2(TILE) butterfly stages entirely in SMEM
+    for (int s = 0; s < log2_tile; s++) {
+        int half = 1 << s;
+        for (int i = threadIdx.x; i < TILE/2; i += blockDim.x) {
+            // butterfly with twiddle factor...
+        }
+        __syncthreads();
+    }
+    // Write tile back (1 write)
+    for (int i = threadIdx.x; i < TILE; i += blockDim.x) {
+        re[base + i] = s_re[i]; im[base + i] = s_im[i];
+    }
+}
+''',
+    },
+
+    "implicit_im2col": {
+        "keywords": ["conv", "im2col", "convolution", "implicit", "unfold"],
+        "when": "Conv2D via im2col materializes a huge unfolded matrix (N*OH*OW, C_in*KH*KW) to HBM before GEMM.",
+        "wrong": "Explicit im2col: write full unfolded matrix to HBM, then read it back for GEMM. For ResNet-50 conv3: 56GB intermediate!",
+        "right": "Implicit im2col: in each GEMM tile, gather the required input patches on-the-fly from the original NCHW tensor into SMEM. Never materialize the unfolded matrix. This is what cuDNN's implicit GEMM does.",
+        "code": '''
+// Implicit im2col: gather patches on-the-fly in SMEM
+template <int BM, int BN, int BK>
+__global__ void implicit_conv2d(
+    const float* input,  // (N,C_in,H,W)
+    const float* weight, // (C_out, C_in*KH*KW)
+    float* output, ...) {
+    __shared__ float sA[BM][BK]; // im2col tile (gathered, NOT from HBM buffer)
+    __shared__ float sB[BK][BN]; // weight tile
+    // For each K-tile:
+    //   sA[m][k] = input at the position implied by output pixel m, kernel offset k
+    //   sB[k][n] = weight[n][k]
+    //   C += sA * sB  (GEMM in SMEM)
+    // col_matrix never exists in HBM!
+}
+''',
+    },
+
+    "temporal_tiling_stencil": {
+        "keywords": ["stencil", "temporal", "tiling", "jacobi", "halo", "ghost"],
+        "when": "Iterative stencil (Jacobi, Gauss-Seidel) reads/writes full grid each iteration. T iterations → T HBM round-trips.",
+        "wrong": "Launch one kernel per iteration. Each iteration reads H×W from HBM and writes H×W back.",
+        "right": "Temporal tiling: load (BH+2S)×(BW+2S) halo region once, apply S iterations in SMEM, write back BH×BW. Reduces HBM round-trips by factor S. Trade-off: larger halo = more redundant loads, but fewer global passes.",
+        "code": '''
+// Flash Stencil: fuse S iterations in shared memory
+template <int BH, int BW, int S>
+__global__ void flash_stencil(const float* in, float* out, int H, int W) {
+    __shared__ float tile[2][(BH+2*S)][(BW+2*S)]; // double-buffer
+    // Load halo region from HBM (1 read, includes ghost cells)
+    // for iter in 0..S:
+    //   apply 5-point stencil in SMEM (zero HBM traffic)
+    //   swap buffers
+    // Write inner BH×BW back to HBM (1 write)
+}
+// HBM IO: ceil(T/S) × (BH+2S)×(BW+2S) per tile vs T × H×W total
+// For S=8: ~8× fewer HBM round-trips
+''',
+    },
 }
 
 
@@ -1092,6 +1539,88 @@ def _make_benchmarks():
 
     benchmarks["softmax"] = {"setup": sm_setup, "baseline": sm_baseline, "flash": sm_flash}
 
+    # ---- FFT ----
+    def fft_setup(p):
+        N = p.get("N", 1048576)
+        torch.manual_seed(42)
+        x_re = torch.randn(N, device="cuda")
+        x_im = torch.zeros(N, device="cuda")
+        return {"x_re": x_re, "x_im": x_im, "N": N}
+
+    def fft_baseline(t):
+        # Standard: use torch.fft (cuFFT internally)
+        x = torch.complex(t["x_re"], t["x_im"])
+        return torch.fft.fft(x)
+
+    def fft_flash(t):
+        # Same — no custom kernel here, benchmark via triton_codegen
+        x = torch.complex(t["x_re"], t["x_im"])
+        return torch.fft.fft(x)
+
+    benchmarks["fft"] = {"setup": fft_setup, "baseline": fft_baseline, "flash": fft_flash,
+                         "library": fft_flash, "library_name": "cuFFT"}
+
+    # ---- Conv2D ----
+    def conv_setup(p):
+        N_b = p.get("N", 64)
+        C_in, C_out = p.get("C_in", 128), p.get("C_out", 256)
+        H, W = p.get("H", 56), p.get("W", 56)
+        KH, KW = p.get("KH", 3), p.get("KW", 3)
+        torch.manual_seed(42)
+        inp = torch.randn(N_b, C_in, H, W, device="cuda")
+        wt = torch.randn(C_out, C_in, KH, KW, device="cuda")
+        return {"input": inp, "weight": wt, "pad": (KH // 2, KW // 2)}
+
+    def conv_baseline(t):
+        # Explicit im2col + GEMM (materialized)
+        inp, wt = t["input"], t["weight"]
+        N_b, C_in, H, W = inp.shape
+        C_out, _, KH, KW = wt.shape
+        pad_h, pad_w = t["pad"]
+        # torch.nn.functional.unfold = im2col, materializes (N, C*K*K, L)
+        col = F.unfold(inp, (KH, KW), padding=(pad_h, pad_w))  # materialized!
+        wt_flat = wt.reshape(C_out, -1)
+        out = wt_flat @ col  # GEMM
+        OH = H + 2 * pad_h - KH + 1
+        OW = W + 2 * pad_w - KW + 1
+        return out.reshape(N_b, C_out, OH, OW)
+
+    def conv_cudnn(t):
+        # cuDNN: PyTorch conv2d uses cuDNN (implicit GEMM / Winograd)
+        return F.conv2d(t["input"], t["weight"], padding=t["pad"])
+
+    benchmarks["conv2d"] = {"setup": conv_setup, "baseline": conv_baseline, "flash": conv_cudnn,
+                            "library": conv_cudnn, "library_name": "cuDNN"}
+
+    # ---- Stencil2D ----
+    def stencil_setup(p):
+        H, W = p.get("H", 4096), p.get("W", 4096)
+        T = p.get("T", 100)
+        torch.manual_seed(42)
+        grid = torch.randn(H, W, device="cuda")
+        return {"grid": grid, "T": T, "H": H, "W": W}
+
+    def stencil_baseline(t):
+        # Standard: T iterations, each a full HBM read/write
+        g = t["grid"].clone()
+        out = torch.empty_like(g)
+        H, W = t["H"], t["W"]
+        for _ in range(t["T"]):
+            # 5-point stencil via slicing (PyTorch, materializes every step)
+            out[1:-1, 1:-1] = 0.2 * (
+                g[1:-1, 1:-1] +
+                g[:-2, 1:-1] + g[2:, 1:-1] +
+                g[1:-1, :-2] + g[1:-1, 2:]
+            )
+            g, out = out, g
+        return g
+
+    def stencil_flash(t):
+        # Same as baseline for Python-level — real flash is via CUDA kernel
+        return stencil_baseline(t)
+
+    benchmarks["stencil2d"] = {"setup": stencil_setup, "baseline": stencil_baseline, "flash": stencil_flash}
+
     return benchmarks
 
 _BENCHMARKS = _make_benchmarks()
@@ -1120,6 +1649,12 @@ def run_react_agent(task: str, verbose: bool = True) -> IOEnvironment:
     obs, reward, done = env.step(thought, "analyze", {"task": task})
     if verbose:
         _print_react_step(0, thought, "analyze", {"task": task}, obs, reward)
+
+    # Step 0.5: Pre-check
+    thought = "Before optimizing, let me run the multi-dimensional pre-check to verify IO optimization is appropriate."
+    obs, reward, done = env.step(thought, "pre_check", {})
+    if verbose:
+        _print_react_step(0, thought, "pre_check", {}, obs, reward)
 
     # Step 1+: Optimize
     max_steps = 5

@@ -187,7 +187,7 @@ def run_llm_react_agent(task: str, model: str = "gpt-5.2",
     initial_obs = env.reset(task)
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Optimize this operator. Here is the initial analysis:\n\n{initial_obs}\n\nBegin by examining the IO bottlenecks and proposing your first optimization."},
+        {"role": "user", "content": f"Optimize this operator. Here is the initial analysis:\n\n{initial_obs}\n\nFirst, run 'pre_check' to verify IO optimization is appropriate, then proceed with optimization."},
     ]
 
     if verbose:
@@ -243,7 +243,18 @@ def run_llm_react_agent(task: str, model: str = "gpt-5.2",
         messages.append({"role": "assistant", "content": response})
 
         # Contextual nudge based on what just happened
-        if tool == "verify" and "ALL PASSED" in obs:
+        if tool == "analyze":
+            nudge = ("Analysis complete. Now run 'pre_check' to verify whether IO optimization "
+                     "is appropriate for this operator (checks memory-bound, L2 cache, GEMM structure).")
+        elif tool == "pre_check":
+            if "CAUTION" in obs:
+                nudge = ("Pre-check raised CAUTION. Read the warnings carefully. "
+                         "IO optimization may not yield speedup for this operator. "
+                         "Consider the recommendations before proceeding.")
+            else:
+                nudge = ("Pre-check passed. Proceed with IO optimization. "
+                         "Apply fuse_and_online or fuse_ops to eliminate materialized intermediates.")
+        elif tool == "verify" and "ALL PASSED" in obs:
             nudge = ("Verification passed! Now you MUST generate an actual Triton GPU kernel. "
                      "Call 'generate_kernel' to create the kernel, then 'compile_and_test' to verify it, "
                      "then 'benchmark_kernel' to measure real speedup.")
@@ -258,14 +269,46 @@ def run_llm_react_agent(task: str, model: str = "gpt-5.2",
             # Check if speedup < 1.0
             is_slow = "slower" in obs.lower() or "0." in obs.split("Speedup:")[-1].split("×")[0] if "Speedup:" in obs else False
             if is_slow:
-                nudge = ("KERNEL IS SLOWER THAN BASELINE. You MUST improve it. "
-                         "Step 1: Call 'profile_kernel' to diagnose WHY it's slow. "
-                         "Step 2: Call 'retrieve_pattern' to learn the correct optimization pattern. "
-                         "Step 3: Write an improved kernel with generate_kernel(custom_code=...). "
-                         "DO NOT call 'done' until speedup >= 1.0× or you've exhausted optimization options.")
+                nudge = ("KERNEL IS SLOWER THAN BASELINE. Use data-driven diagnosis: "
+                         "Step 1: Call 'ncu_profile' to get runtime bandwidth/compute utilization. "
+                         "Step 2: Call 'library_ceiling' to see how far from optimal. "
+                         "Step 3: Based on diagnosis, either rewrite kernel or accept result. "
+                         "DO NOT guess — let the profiling data guide your fix.")
             else:
                 nudge = ("Kernel achieves speedup! You can call 'autotune_kernel' to sweep block sizes "
                          "for even better performance, or call 'done' with your final analysis.")
+        elif tool == "ncu_profile":
+            if "under-utilized" in obs.lower():
+                nudge = ("Kernel is UNDER-UTILIZED (low bandwidth AND compute). "
+                         "This is a structural problem. Call 'compare_profile' to see what changed "
+                         "vs baseline, then 'retrieve_pattern' to learn the correct pattern.")
+            elif "NOT using Tensor Core" in obs or "NO ✗" in obs:
+                nudge = ("Kernel is NOT using Tensor Core. For distance/matmul patterns, "
+                         "call 'retrieve_pattern' with 'gemm_online_reduce' to learn how to add tl.dot.")
+            elif "memory-bound" in obs.lower() and "good" in obs.lower():
+                nudge = ("Kernel is memory-bound with good utilization — IO optimization is working! "
+                         "Try 'autotune_kernel' for final tuning, or call 'done'.")
+            else:
+                nudge = ("Review the profiling results above. If compute-bound with TC, "
+                         "the kernel may be near optimal. Consider 'library_ceiling' to check.")
+        elif tool == "library_ceiling":
+            if "Gap > 10" in obs or "fundamental" in obs.lower():
+                nudge = ("Library is 10×+ faster — gap too large for hand-written kernel. "
+                         "Consider accepting the current result and calling 'done' with explanation.")
+            elif "near optimal" in obs.lower() or "Within 1.5" in obs:
+                nudge = "You're near optimal! Call 'done' with your final analysis."
+            else:
+                nudge = ("There's room for improvement. Call 'ncu_profile' to identify "
+                         "the specific bottleneck, then fix and retry.")
+        elif tool == "compare_profile":
+            nudge = ("Review the side-by-side comparison above. Focus on the biggest difference "
+                     "(bandwidth util, compute util, or TC usage) and fix that dimension first.")
+        elif tool == "occupancy_analysis":
+            if "LOW OCCUPANCY" in obs:
+                nudge = ("Low occupancy detected. Adjust BLOCK_SIZE, num_warps, or reduce register pressure "
+                         "in your kernel, then regenerate with 'generate_kernel'.")
+            else:
+                nudge = "Occupancy is acceptable. Focus on other optimization dimensions."
         elif tool == "benchmark":
             nudge = ("That was the Python-level benchmark. Now generate the REAL Triton kernel: "
                      "call 'generate_kernel', then 'compile_and_test', then 'benchmark_kernel'.")

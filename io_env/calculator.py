@@ -66,6 +66,43 @@ class OpIOStats:
 
 
 @dataclass
+class PreCheckResult:
+    """Result of multi-dimensional pre-optimization checklist."""
+    is_memory_bound: bool = True
+    data_fits_l2: bool = False
+    has_gemm_structure: bool = False
+    has_atomic_risk: bool = False
+    io_optimization_recommended: bool = True
+    warnings: list[str] = field(default_factory=list)
+    details: dict = field(default_factory=dict)
+
+    def display(self) -> str:
+        lines = [
+            "┌─── Pre-Optimization Checklist ──────────────────┐",
+        ]
+        checks = [
+            ("Memory-bound?", self.is_memory_bound, True,
+             "IO optimization effective" if self.is_memory_bound else "Compute-bound — IO optimization may not help"),
+            ("Data > L2 cache?", not self.data_fits_l2, True,
+             "IO analysis trustworthy" if not self.data_fits_l2 else "Data fits L2 — actual HBM traffic may be lower"),
+            ("GEMM structure?", self.has_gemm_structure, None,
+             "Must preserve tl.dot/Tensor Core" if self.has_gemm_structure else "No GEMM to protect"),
+            ("Atomic risk?", not self.has_atomic_risk, True,
+             "No atomic contention" if not self.has_atomic_risk else "Optimization may introduce atomic contention"),
+        ]
+        for label, value, good_val, detail in checks:
+            icon = "✓" if (good_val is None or value == good_val) else "✗"
+            lines.append(f"│  [{icon}] {label:<22s} {detail}")
+        lines.append(f"├─────────────────────────────────────────────────┤")
+        verdict = "✓ RECOMMENDED" if self.io_optimization_recommended else "⚠ CAUTION"
+        lines.append(f"│  IO Optimization: {verdict}")
+        for w in self.warnings:
+            lines.append(f"│    ⚠ {w}")
+        lines.append(f"└─────────────────────────────────────────────────┘")
+        return "\n".join(lines)
+
+
+@dataclass
 class IOReport:
     """Complete IO analysis report for a computation graph."""
     graph_name: str
@@ -81,6 +118,7 @@ class IOReport:
     bottleneck: str = ""
     materialized_intermediates: list[str] = field(default_factory=list)
     optimization_hints: list[str] = field(default_factory=list)
+    pre_check: PreCheckResult | None = None
 
     @property
     def total_io(self) -> int:
@@ -139,6 +177,88 @@ class IOReport:
                     f"[OPPORTUNITY] Eliminating all intermediate materialization would save "
                     f"{total_mat_bytes/1e6:.1f} MB ({saving_pct:.0f}% of total IO)."
                 )
+
+        # --- Dim 3: Cache analysis ---
+        largest_intermediate_bytes = max(
+            (op.hbm_writes for op in self.op_stats
+             if op.is_intermediate and op.storage == "HBM"),
+            default=0,
+        )
+        l2_bytes = hw.l2_cache_mb * 1e6
+        if largest_intermediate_bytes > 0 and largest_intermediate_bytes < l2_bytes:
+            self.optimization_hints.append(
+                f"[CACHE] Largest intermediate ({largest_intermediate_bytes/1e6:.1f} MB) fits "
+                f"in L2 cache ({hw.l2_cache_mb} MB). Actual HBM traffic may be lower than analyzed. "
+                f"IO reduction may NOT translate to proportional speedup."
+            )
+
+        # --- Dim 2: Compute-bound warning ---
+        if self.bottleneck == "compute-bound":
+            self.optimization_hints.append(
+                f"[COMPUTE-BOUND] Overall AI={self.arithmetic_intensity:.1f} FLOP/B > "
+                f"balance point {hw.balance_point:.1f}. IO optimization may yield VRAM savings "
+                f"but NOT wall-clock speedup. Focus on compute efficiency instead."
+            )
+
+        self._generate_pre_check(hw)
+
+    def _generate_pre_check(self, hw: HardwareSpec):
+        """Run the 7-dimension pre-optimization checklist."""
+        pc = PreCheckResult()
+
+        # Dim 1: IO opportunity
+        total_mat_bytes = sum(
+            op.hbm_writes for op in self.op_stats
+            if op.is_intermediate and op.storage == "HBM"
+        )
+        pc.details["materialized_bytes"] = total_mat_bytes
+
+        # Dim 2: Memory-bound vs compute-bound
+        pc.is_memory_bound = self.bottleneck == "memory-bound"
+        pc.details["arithmetic_intensity"] = self.arithmetic_intensity
+        pc.details["balance_point"] = hw.balance_point
+        if not pc.is_memory_bound:
+            pc.warnings.append(
+                f"Compute-bound (AI={self.arithmetic_intensity:.1f} > "
+                f"{hw.balance_point:.1f}). IO reduction may not improve wall-clock time."
+            )
+
+        # Dim 3: L2 cache
+        largest_intermediate_bytes = max(
+            (op.hbm_writes for op in self.op_stats
+             if op.is_intermediate and op.storage == "HBM"),
+            default=0,
+        )
+        l2_bytes = hw.l2_cache_mb * 1e6
+        pc.data_fits_l2 = largest_intermediate_bytes > 0 and largest_intermediate_bytes < l2_bytes
+        pc.details["largest_intermediate_mb"] = largest_intermediate_bytes / 1e6
+        pc.details["l2_cache_mb"] = hw.l2_cache_mb
+        if pc.data_fits_l2:
+            pc.warnings.append(
+                f"Data ({largest_intermediate_bytes/1e6:.1f} MB) fits in L2 ({hw.l2_cache_mb} MB). "
+                f"Sequential scan may beat random gather."
+            )
+
+        # Dim 4: GEMM structure detection
+        for op in self.op_stats:
+            computes = op.name.lower() + " " + op.notes.lower()
+            if any(kw in computes for kw in ("gemm", "matmul", "dot", "distance", "cdist")):
+                pc.has_gemm_structure = True
+                break
+        if pc.has_gemm_structure:
+            pc.warnings.append(
+                "Baseline uses GEMM/matmul — optimization MUST preserve tl.dot/Tensor Core structure."
+            )
+
+        # Overall recommendation
+        pc.io_optimization_recommended = True
+        if not pc.is_memory_bound and pc.data_fits_l2:
+            pc.io_optimization_recommended = False
+        if total_mat_bytes == 0:
+            pc.io_optimization_recommended = False
+            pc.warnings.append("No materialized intermediates to eliminate.")
+
+        self.pre_check = pc
 
     def display(self) -> str:
         lines = [
