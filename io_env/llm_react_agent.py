@@ -268,41 +268,85 @@ def run_llm_react_agent(task: str, model: str = "gpt-5.2",
         elif tool == "benchmark_kernel":
             # Check if speedup < 1.0
             is_slow = "slower" in obs.lower() or "0." in obs.split("Speedup:")[-1].split("×")[0] if "Speedup:" in obs else False
-            if is_slow:
+            is_regression = "REGRESSION" in obs
+            # Extract speedup value
+            speedup_val = 1.0
+            for bline in obs.split("\n"):
+                if "Speedup:" in bline:
+                    try: speedup_val = float(bline.split(":")[-1].strip().rstrip("×"))
+                    except ValueError: pass
+
+            if is_regression:
+                nudge = ("⚠ Your new kernel is SLOWER than the previous best! "
+                         "The environment auto-rolled back to the best kernel. "
+                         "Call 'ncu_profile' on the best kernel to understand its limits. "
+                         "Then try a FUNDAMENTALLY DIFFERENT approach, not small tweaks. "
+                         "If you've already tried 2+ approaches, call 'done' — the best kernel is active.")
+            elif is_slow:
                 nudge = ("KERNEL IS SLOWER THAN BASELINE. Use data-driven diagnosis: "
                          "Step 1: Call 'ncu_profile' to get runtime bandwidth/compute utilization. "
                          "Step 2: Call 'library_ceiling' to see how far from optimal. "
                          "Step 3: Based on diagnosis, either rewrite kernel or accept result. "
                          "DO NOT guess — let the profiling data guide your fix.")
+            elif speedup_val < 2.0:
+                nudge = (f"Speedup is {speedup_val:.2f}× — decent but there may be room for improvement. "
+                         "Call 'ncu_profile' to check bandwidth/compute utilization. "
+                         "If bandwidth > 70%, you're near memory-bound limit — try 'autotune_kernel'. "
+                         "If compute util is low, there may be a parallelism issue to fix. "
+                         "Call 'library_ceiling' to see how far from optimal.")
             else:
-                nudge = ("Kernel achieves speedup! You can call 'autotune_kernel' to sweep block sizes "
-                         "for even better performance, or call 'done' with your final analysis.")
+                nudge = (f"Great speedup ({speedup_val:.2f}×)! But don't stop yet — "
+                         "call 'ncu_profile' to check bandwidth utilization, "
+                         "then 'library_ceiling' to see the ceiling, "
+                         "then try 'autotune_kernel' to squeeze out more performance. "
+                         "Only call 'done' after you've profiled AND tried autotune.")
         elif tool == "ncu_profile":
             if "under-utilized" in obs.lower():
                 nudge = ("Kernel is UNDER-UTILIZED (low bandwidth AND compute). "
                          "This is a structural problem. Call 'compare_profile' to see what changed "
-                         "vs baseline, then 'retrieve_pattern' to learn the correct pattern.")
+                         "vs baseline, then 'retrieve_pattern' to learn the correct pattern. "
+                         "After fixing: generate_kernel → compile_and_test → benchmark_kernel → ncu_profile again.")
             elif "NOT using Tensor Core" in obs or "NO ✗" in obs:
                 nudge = ("Kernel is NOT using Tensor Core. For distance/matmul patterns, "
-                         "call 'retrieve_pattern' with 'gemm_online_reduce' to learn how to add tl.dot.")
+                         "call 'retrieve_pattern' with 'gemm_online_reduce' to learn how to add tl.dot. "
+                         "After fixing: generate_kernel → compile_and_test → benchmark_kernel → ncu_profile again.")
             elif "memory-bound" in obs.lower() and "good" in obs.lower():
                 nudge = ("Kernel is memory-bound with good utilization — IO optimization is working! "
-                         "Try 'autotune_kernel' for final tuning, or call 'done'.")
-            else:
-                nudge = ("Review the profiling results above. If compute-bound with TC, "
-                         "the kernel may be near optimal. Consider 'library_ceiling' to check.")
+                         "Now call 'library_ceiling' to see the gap, then 'autotune_kernel' to try "
+                         "different block sizes. Re-benchmark and re-profile after autotune.")
+            elif "compute-bound" in obs.lower():
+                if "Tensor Core" in obs and "YES" in obs:
+                    nudge = ("Kernel is compute-bound WITH Tensor Core — good efficiency. "
+                             "Call 'library_ceiling' to see if there's still a gap, "
+                             "then try 'autotune_kernel'. Only 'done' after trying autotune.")
+                else:
+                    nudge = ("Kernel is compute-bound but WITHOUT Tensor Core. "
+                             "Add tl.dot for Tensor Core usage. "
+                             "After fixing: generate_kernel → compile_and_test → benchmark_kernel → ncu_profile again.")
         elif tool == "library_ceiling":
             if "Gap > 10" in obs or "fundamental" in obs.lower():
-                nudge = ("Library is 10×+ faster — gap too large for hand-written kernel. "
-                         "Consider accepting the current result and calling 'done' with explanation.")
+                nudge = ("Library is 10×+ faster — your kernel has fundamental issues. "
+                         "If you haven't tried 'ncu_profile' yet, do that first to diagnose. "
+                         "Otherwise, try a different algorithm (e.g., tl.dot for GEMM). "
+                         "If you've already iterated 2+ times, accept and call 'done' with explanation.")
             elif "near optimal" in obs.lower() or "Within 1.5" in obs:
-                nudge = "You're near optimal! Call 'done' with your final analysis."
+                nudge = ("Close to library ceiling! But before calling 'done', "
+                         "try 'autotune_kernel' to sweep block sizes — you might gain another 10-30%. "
+                         "After autotune, re-benchmark and re-profile to confirm final performance.")
+            elif "Gap 1.5-3" in obs:
+                nudge = ("Within 3× of library — try 'autotune_kernel' to close the gap, "
+                         "then 'benchmark_kernel' and 'ncu_profile' to verify improvement.")
             else:
                 nudge = ("There's room for improvement. Call 'ncu_profile' to identify "
-                         "the specific bottleneck, then fix and retry.")
+                         "the bottleneck, fix it, then benchmark_kernel → ncu_profile again.")
         elif tool == "compare_profile":
             nudge = ("Review the side-by-side comparison above. Focus on the biggest difference "
-                     "(bandwidth util, compute util, or TC usage) and fix that dimension first.")
+                     "(bandwidth util, compute util, or TC usage) and fix that dimension first. "
+                     "Then generate_kernel → compile_and_test → benchmark_kernel → ncu_profile.")
+        elif tool == "autotune_kernel":
+            nudge = ("Autotune complete! Now call 'benchmark_kernel' to measure the tuned kernel, "
+                     "then 'ncu_profile' to verify utilization improved. "
+                     "If this is your best result after profiling, you can call 'done'.")
         elif tool == "occupancy_analysis":
             if "LOW OCCUPANCY" in obs:
                 nudge = ("Low occupancy detected. Adjust BLOCK_SIZE, num_warps, or reduce register pressure "

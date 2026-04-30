@@ -185,6 +185,12 @@ class IOEnvironment:
         self.history: list[StepLog] = []
         self.task_name: str = ""
         self._graph_stack: list[tuple[ComputationGraph, IOReport]] = []
+        # Kernel version tracking
+        self._kernel_path: str | None = None
+        self._best_kernel_path: str | None = None
+        self._best_speedup: float = 0.0
+        self._kernel_version: int = 0
+        self._kernel_history: list[tuple[str, float]] = []  # (path, speedup)
 
     def reset(self, task_name: str, params: dict | None = None) -> str:
         """Reset the environment with a new task. Returns initial observation."""
@@ -200,6 +206,11 @@ class IOEnvironment:
         self.history = []
         self._graph_stack = []
         self.task_name = task_name
+        self._kernel_path = None
+        self._best_kernel_path = None
+        self._best_speedup = 0.0
+        self._kernel_version = 0
+        self._kernel_history = []
 
         return self._make_observation("analyze")
 
@@ -315,12 +326,30 @@ Phase 3 — Iterate if Needed:
 9. Repeat compile_and_test + benchmark_kernel until speedup >= 1.0×
 10. Use 'autotune_kernel' to sweep block sizes for the best configuration
 
-Phase 3 — Diagnose Slow Kernels (DATA-DRIVEN):
-If benchmark_kernel shows speedup < 1.0×, DO NOT guess — use profiling tools:
+Phase 3 — Diagnose & Iterate (DATA-DRIVEN LOOP):
+ALWAYS profile after benchmarking — even if speedup > 1.0×:
 11. 'ncu_profile' → get runtime metrics: bandwidth util %, compute util %, Tensor Core usage
 12. 'library_ceiling' → see performance gap vs cuDNN/cuFFT/cuBLAS
-13. 'compare_profile' → see what changed vs baseline (side-by-side)
-14. 'occupancy_analysis' → check if occupancy is limiting performance
+13. 'compare_profile' → side-by-side baseline vs flash
+14. 'occupancy_analysis' → check occupancy bottleneck
+15. Based on ALL profiling data, try to improve:
+    - 'autotune_kernel' to sweep block sizes
+    - Rewrite kernel with different BLOCK_SIZE, num_warps, or algorithm
+    - Add tl.dot if missing Tensor Core usage
+16. Re-benchmark and re-profile to verify improvement
+
+MINIMUM EXPLORATION before 'done':
+  - You MUST call 'ncu_profile' at least once
+  - You MUST call 'library_ceiling' at least once
+  - You SHOULD try 'autotune_kernel' if speedup < 3× of library
+  - You SHOULD try at least 2 kernel versions before concluding
+  - Only call 'done' when you've explored AND one of:
+    (a) BW utilization > 70% (hitting memory bandwidth limit)
+    (b) Within 1.5× of library ceiling after autotune
+    (c) 3+ kernel versions tried with diminishing returns
+
+THE ITERATION LOOP (repeat until converged or max 3 iterations):
+  benchmark_kernel → ncu_profile → diagnose → fix → benchmark_kernel → ncu_profile → ...
 
 Decision tree based on profiling results:
   - bandwidth_util < 30% AND compute_util < 10% → STRUCTURAL PROBLEM
@@ -337,9 +366,11 @@ Decision tree based on profiling results:
 - You MUST run 'pre_check' after 'analyze' before applying optimizations.
 - You MUST write Triton kernel code. DO NOT generate Python-only solutions.
 - You MUST achieve speedup >= 1.0× or explain clearly why it's not possible.
-- After benchmark_kernel, if speedup < 1.0×, ALWAYS call 'ncu_profile' before rewriting.
+- After EVERY benchmark_kernel, ALWAYS call 'ncu_profile' to verify kernel efficiency.
+- ITERATE: if ncu_profile reveals a fixable issue, fix and re-benchmark. Max 3 iterations.
 - If pre_check warns about GEMM structure, you MUST use tl.dot in your kernel.
-- Use 'library_ceiling' to know when to stop optimizing (within 2× of library = good enough).
+- DO NOT call 'done' too early. Explore at least: ncu_profile + library_ceiling + one autotune attempt.
+- ONLY call 'done' after you have profiling data confirming you're near the hardware limit.
 
 ## Response Format
 Thought: <your reasoning>
@@ -614,19 +645,24 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
     def _tool_generate_kernel(self, args: dict) -> tuple[str, float, bool]:
         """Generate a Triton or CUDA kernel for the current task."""
         from io_env.triton_codegen import generate_kernel
+        import shutil
         custom_code = args.get("custom_code")
         lang = args.get("lang", "triton")
         code, filepath = generate_kernel(self.task_name, custom_code, lang=lang)
         if not code:
             return filepath, 0.0, False  # filepath contains error message
+        self._kernel_version += 1
         self._kernel_path = filepath
+        # Save a versioned copy so we can rollback
+        versioned = filepath.replace(".py", f"_v{self._kernel_version}.py")
+        shutil.copy2(filepath, versioned)
         # Show first 40 lines
         lines = code.strip().split("\n")
         preview = "\n".join(lines[:40])
         if len(lines) > 40:
             preview += f"\n... ({len(lines) - 40} more lines)"
         lang_tag = "CUDA C++" if lang == "cuda" else "Triton"
-        obs = f"Generated {lang_tag} kernel: {filepath}\n\n{preview}"
+        obs = f"Generated {lang_tag} kernel v{self._kernel_version}: {filepath}\n\n{preview}"
         return obs, 1.0, False
 
     def _tool_compile_and_test(self, args: dict) -> tuple[str, float, bool]:
@@ -640,6 +676,7 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
     def _tool_benchmark_kernel(self, args: dict) -> tuple[str, float, bool]:
         """Benchmark the generated Triton kernel vs materialized baseline."""
         from io_env.triton_codegen import benchmark_kernel
+        import shutil
         filepath = getattr(self, '_kernel_path', None)
         obs = benchmark_kernel(self.task_name, self.params, filepath)
         # Extract speedup for reward
@@ -652,6 +689,29 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
                     reward = 3.0 * (speedup_val - 1.0)
                 except ValueError:
                     pass
+
+        # Track kernel history
+        self._kernel_history.append((filepath, speedup_val))
+
+        # Version comparison: detect regression and auto-rollback
+        if speedup_val > self._best_speedup:
+            prev_best = self._best_speedup
+            self._best_speedup = speedup_val
+            self._best_kernel_path = filepath
+            if prev_best > 0:
+                obs += f"\n\n✓ NEW BEST: v{self._kernel_version} = {speedup_val:.2f}× (previous best: {prev_best:.2f}×)"
+            else:
+                obs += f"\n\n✓ FIRST KERNEL: v{self._kernel_version} = {speedup_val:.2f}×"
+        elif self._best_speedup > 0 and speedup_val < self._best_speedup * 0.95:
+            # Regression detected — rollback to best
+            obs += f"\n\n⚠ REGRESSION: v{self._kernel_version} = {speedup_val:.2f}× < best {self._best_speedup:.2f}×"
+            obs += f"\n  Auto-rolling back to best kernel."
+            if self._best_kernel_path and os.path.exists(self._best_kernel_path):
+                shutil.copy2(self._best_kernel_path, filepath)
+                self._kernel_path = filepath
+            obs += f"\n  The best kernel is still active. Use 'ncu_profile' to understand its limits, then try a DIFFERENT approach."
+            speedup_val = self._best_speedup  # use best for reward
+
         # If kernel is slow, show the current code so agent can improve it
         if speedup_val < 1.0 and filepath and os.path.exists(filepath):
             with open(filepath) as f:
@@ -1168,6 +1228,14 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
         mats = self.graph.get_materialized_intermediates()
         lines.append(f"Materialized intermediates: {len(mats)}" +
                      (" ✓" if not mats else f" ⚠ {[n for n,_ in mats]}"))
+
+        # Kernel version history
+        if self._kernel_history:
+            lines.append(f"\nKernel versions tested: {len(self._kernel_history)}")
+            for i, (path, spd) in enumerate(self._kernel_history):
+                best = " ← BEST" if spd == self._best_speedup else ""
+                lines.append(f"  v{i+1}: {spd:.2f}×{best}")
+            lines.append(f"Best kernel speedup: {self._best_speedup:.2f}×")
 
         if self.history:
             lines.append("\nTrace:")
