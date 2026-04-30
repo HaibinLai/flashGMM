@@ -217,6 +217,123 @@ def reference_softmax(X: torch.Tensor) -> torch.Tensor:
 _KERNEL_DIR = os.path.join(tempfile.gettempdir(), "io_env_kernels")
 os.makedirs(_KERNEL_DIR, exist_ok=True)
 
+# ============================================================================
+# CUDA kernel templates
+# ============================================================================
+
+CUDA_TEMPLATES = {}
+
+CUDA_TEMPLATES["gmm_estep"] = r'''
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <float.h>
+
+static constexpr float LOG_2PI = 1.8378770664093453f;
+
+// Flash Log-Normalizer: online log-sum-exp, zero N×K materialization
+template <int BK>
+__global__ void flash_log_normalizer_kernel(
+    const float* __restrict__ X,          // (N, d)
+    const float* __restrict__ mu,         // (K, d)
+    const float* __restrict__ inv_var,    // (K, d) = 1/var
+    const float* __restrict__ half_const, // (K,) = log_pi - 0.5*(d*LOG_2PI + sum_log_var)
+    float* __restrict__ log_normalizer,   // (N,)
+    int N, int K, int d, int BN
+) {
+    extern __shared__ float smem[];
+    float* mu_tile = smem;
+    float* iv_tile = mu_tile + BK * d;
+    float* hc_tile = iv_tile + BK * d;
+
+    int block_start = blockIdx.x * BN;
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+    int valid_n = min(BN, N - block_start);
+
+    // Per-point running state
+    constexpr int MAX_PTS = 4;
+    float running_max[MAX_PTS], running_sum_exp[MAX_PTS];
+    for (int i = 0; i < MAX_PTS; i++) {
+        running_max[i] = -FLT_MAX;
+        running_sum_exp[i] = 0.0f;
+    }
+
+    for (int t = 0; t < K; t += BK) {
+        int tile_k = min(BK, K - t);
+        __syncthreads();
+        for (int idx = tid; idx < tile_k * d; idx += nthreads) {
+            mu_tile[idx] = mu[(t + idx / d) * d + idx % d];
+            iv_tile[idx] = inv_var[(t + idx / d) * d + idx % d];
+        }
+        if (tid < tile_k) hc_tile[tid] = half_const[t + tid];
+        __syncthreads();
+
+        int pt = 0;
+        for (int ln = tid; ln < valid_n; ln += nthreads) {
+            int n = block_start + ln;
+            for (int kk = 0; kk < tile_k; kk++) {
+                float mahal = 0.0f;
+                for (int j = 0; j < d; j++) {
+                    float diff = X[n * d + j] - mu_tile[kk * d + j];
+                    mahal += diff * diff * iv_tile[kk * d + j];
+                }
+                float ll = hc_tile[kk] - 0.5f * mahal;
+                if (ll > running_max[pt]) {
+                    running_sum_exp[pt] = running_sum_exp[pt] * expf(running_max[pt] - ll) + 1.0f;
+                    running_max[pt] = ll;
+                } else {
+                    running_sum_exp[pt] += expf(ll - running_max[pt]);
+                }
+            }
+            pt++;
+        }
+    }
+
+    int pt = 0;
+    for (int ln = tid; ln < valid_n; ln += nthreads) {
+        log_normalizer[block_start + ln] = running_max[pt] + logf(running_sum_exp[pt]);
+        pt++;
+    }
+}
+
+// Python-callable wrapper
+torch::Tensor flash_gmm_log_normalizer(
+    torch::Tensor X, torch::Tensor mu, torch::Tensor var, torch::Tensor log_pi
+) {
+    int N = X.size(0), d = X.size(1), K = mu.size(0);
+    auto inv_var = var.reciprocal();
+    auto log_var_sum = var.log().sum(1);
+    auto half_const = log_pi - 0.5f * (d * LOG_2PI + log_var_sum);
+    auto log_norm = torch::empty({N}, X.options());
+
+    int BN = 128, BK = 32, threads = 256;
+    int grid = (N + BN - 1) / BN;
+    size_t smem = (2 * BK * d + BK) * sizeof(float);
+    flash_log_normalizer_kernel<32><<<grid, threads, smem>>>(
+        X.data_ptr<float>(), mu.data_ptr<float>(), inv_var.data_ptr<float>(),
+        half_const.data_ptr<float>(), log_norm.data_ptr<float>(), N, K, d, BN);
+    return log_norm;
+}
+
+// Standard baseline: materialize L
+torch::Tensor standard_gmm_log_normalizer(
+    torch::Tensor X, torch::Tensor mu, torch::Tensor var, torch::Tensor log_pi
+) {
+    int N = X.size(0), d = X.size(1), K = mu.size(0);
+    auto log_det = var.log().sum(1);
+    auto diff = X.unsqueeze(1) - mu.unsqueeze(0);
+    auto mahal = (diff * diff / var.unsqueeze(0)).sum(2);
+    auto L = log_pi.unsqueeze(0) - 0.5f * (d * LOG_2PI + log_det.unsqueeze(0) + mahal);
+    return torch::logsumexp(L, 1);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("flash_gmm_estep", &flash_gmm_log_normalizer, "Flash GMM log-normalizer");
+    m.def("reference_gmm_estep", &standard_gmm_log_normalizer, "Standard GMM log-normalizer");
+}
+'''
+
 TRITON_TEMPLATES["layernorm"] = '''
 import torch
 import triton
@@ -280,9 +397,14 @@ def reference_layernorm(X, gamma, beta, eps=1e-5):
 '''
 
 
-def generate_kernel(task: str, custom_code: str | None = None) -> tuple[str, str]:
+def generate_kernel(task: str, custom_code: str | None = None, lang: str = "triton") -> tuple[str, str]:
     """
-    Generate a Triton kernel for the given task.
+    Generate a Triton or CUDA kernel for the given task.
+
+    Args:
+        task: operator name
+        custom_code: custom kernel code (Triton Python or CUDA C++)
+        lang: "triton" or "cuda"
 
     Returns (code, filepath)
     """
@@ -290,14 +412,57 @@ def generate_kernel(task: str, custom_code: str | None = None) -> tuple[str, str
         code = custom_code
     elif task in TRITON_TEMPLATES:
         code = TRITON_TEMPLATES[task]
+    elif task in CUDA_TEMPLATES:
+        code = CUDA_TEMPLATES[task]
+        lang = "cuda"
     else:
-        return "", f"No template for '{task}'. Available: {list(TRITON_TEMPLATES.keys())}"
+        return "", f"No template for '{task}'. Available Triton: {list(TRITON_TEMPLATES.keys())}, CUDA: {list(CUDA_TEMPLATES.keys())}"
 
-    filepath = os.path.join(_KERNEL_DIR, f"flash_{task}.py")
-    with open(filepath, "w") as f:
-        f.write(code)
+    if lang == "cuda":
+        # CUDA: save .cu + binding .cpp, compile with torch cpp_extension
+        cu_path = os.path.join(_KERNEL_DIR, f"flash_{task}.cu")
+        with open(cu_path, "w") as f:
+            f.write(code)
 
-    return code, filepath
+        # Auto-generate a minimal Python wrapper that loads the compiled module
+        wrapper_code = _make_cuda_wrapper(task, cu_path)
+        py_path = os.path.join(_KERNEL_DIR, f"flash_{task}.py")
+        with open(py_path, "w") as f:
+            f.write(wrapper_code)
+        return code, py_path
+    else:
+        filepath = os.path.join(_KERNEL_DIR, f"flash_{task}.py")
+        with open(filepath, "w") as f:
+            f.write(code)
+        return code, filepath
+
+
+def _make_cuda_wrapper(task: str, cu_path: str) -> str:
+    """Generate a Python wrapper that JIT-compiles a CUDA kernel."""
+    return f'''
+import torch
+from torch.utils.cpp_extension import load
+import os
+
+# JIT compile the CUDA kernel
+_module = load(
+    name="flash_{task}_cuda",
+    sources=["{cu_path}"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    verbose=False,
+)
+
+# Re-export functions - the CUDA module must define flash_{task} and reference_{task}
+def flash_{task}(*args, **kwargs):
+    return _module.flash_{task}(*args, **kwargs)
+
+def reference_{task}(*args, **kwargs):
+    """PyTorch reference."""
+    # Fallback: import from the module if available, else use PyTorch
+    if hasattr(_module, "reference_{task}"):
+        return _module.reference_{task}(*args, **kwargs)
+    raise NotImplementedError("No reference implementation in CUDA module")
+'''
 
 
 def compile_and_test(task: str, params: dict, filepath: str | None = None,
@@ -390,6 +555,17 @@ def compile_and_test(task: str, params: dict, filepath: str | None = None,
                 labels = torch.randint(0, N, (N,), device="cuda")
                 ref_out = ref_fn(X, labels)
                 flash_out = flash_fn(X, labels)
+            max_err = (ref_out - flash_out).abs().max().item()
+            mean_err = (ref_out - flash_out).abs().mean().item()
+
+        elif task in ("gmm_estep", "gmm_em_fused"):
+            N, K, d = params.get("N", 16384), params.get("K", 64), params.get("d", 64)
+            X = torch.randn(N, d, device="cuda")
+            mu = torch.randn(K, d, device="cuda")
+            var = torch.ones(K, d, device="cuda")
+            log_pi = torch.full((K,), -torch.log(torch.tensor(float(K))), device="cuda")
+            ref_out = ref_fn(X, mu, var, log_pi)
+            flash_out = flash_fn(X, mu, var, log_pi)
             max_err = (ref_out - flash_out).abs().max().item()
             mean_err = (ref_out - flash_out).abs().mean().item()
 
@@ -499,6 +675,24 @@ def benchmark_kernel(task: str, params: dict, filepath: str | None = None,
             inputs_flash = (X, labels)
             inputs_ref = (X, labels)
             ref_fn_actual = ref_fn
+    elif task in ("gmm_estep", "gmm_em_fused"):
+        N, K, d = params.get("N", 16384), params.get("K", 64), params.get("d", 64)
+        X = torch.randn(N, d, device="cuda")
+        mu = torch.randn(K, d, device="cuda")
+        var = torch.ones(K, d, device="cuda")
+        log_pi = torch.full((K,), -torch.log(torch.tensor(float(K))), device="cuda")
+        inputs_flash = (X, mu, var, log_pi)
+        inputs_ref = (X, mu, var, log_pi)
+
+        def naive_gmm_logsumexp(X, mu, var, log_pi):
+            d = X.shape[1]
+            log_det = var.log().sum(1)
+            diff = X.unsqueeze(1) - mu.unsqueeze(0)
+            mahal = (diff ** 2 / var.unsqueeze(0)).sum(2)
+            L = log_pi.unsqueeze(0) - 0.5 * (d * 1.8379 + log_det.unsqueeze(0) + mahal)
+            return torch.logsumexp(L, 1)
+
+        ref_fn_actual = naive_gmm_logsumexp
     else:
         return f"No benchmark for '{task}'"
 

@@ -91,11 +91,12 @@ TOOLS = {
         "example": '{"tool": "benchmark", "args": {}}',
     },
     "generate_kernel": {
-        "description": "Generate a Triton GPU kernel implementing the Flash-optimized operator. Uses templates for known patterns (online_logsumexp, online_argmin, online_softmax). Returns the generated code.",
+        "description": "Generate a Triton or CUDA GPU kernel implementing the Flash-optimized operator. Uses templates for known patterns. You can write your own kernel with custom_code (Triton Python or CUDA C++). Set lang='cuda' for CUDA C++ code.",
         "parameters": {
-            "custom_code": "str (optional) — provide your own Triton kernel code instead of using templates",
+            "custom_code": "str (optional) — your own kernel code (Triton Python or CUDA C++)",
+            "lang": "str (optional, default 'triton') — 'triton' for Triton Python, 'cuda' for CUDA C++",
         },
-        "example": '{"tool": "generate_kernel", "args": {}}',
+        "example": '{"tool": "generate_kernel", "args": {"lang": "cuda", "custom_code": "<CUDA C++ code>"}}',
     },
     "compile_and_test": {
         "description": "Compile the generated Triton kernel and run correctness tests against the PyTorch reference implementation. Reports max/mean error.",
@@ -225,10 +226,11 @@ Phase 1 — Symbolic IO Analysis:
 3. 'verify' the symbolic optimization
 
 Phase 2 — Kernel Generation + Testing (THE REAL DELIVERABLE):
-4. 'generate_kernel' to create a Triton GPU kernel
-   - The default template is a starting point. You can (and should) write your own with custom_code.
-   - The kernel must be written in Triton (@triton.jit), NOT plain Python.
-   - DO NOT just call PyTorch ops — write actual GPU kernel code with tl.load, tl.store, tl.arange.
+4. 'generate_kernel' to create a Triton or CUDA GPU kernel
+   - Default: use template if available. Otherwise write your own with custom_code.
+   - For Triton: @triton.jit kernel with tl.load, tl.store, tl.dot, tl.arange.
+   - For CUDA: C++ with __global__ kernels + PYBIND11_MODULE. Set lang='cuda'.
+   - DO NOT just call PyTorch ops — write actual GPU kernel code.
 5. 'compile_and_test' to verify correctness against PyTorch reference
 6. 'benchmark_kernel' to measure ACTUAL speedup vs materialized baseline
 
@@ -496,19 +498,21 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
                 pass
 
     def _tool_generate_kernel(self, args: dict) -> tuple[str, float, bool]:
-        """Generate a Triton kernel for the current task."""
+        """Generate a Triton or CUDA kernel for the current task."""
         from io_env.triton_codegen import generate_kernel
         custom_code = args.get("custom_code")
-        code, filepath = generate_kernel(self.task_name, custom_code)
+        lang = args.get("lang", "triton")
+        code, filepath = generate_kernel(self.task_name, custom_code, lang=lang)
         if not code:
             return filepath, 0.0, False  # filepath contains error message
         self._kernel_path = filepath
-        # Show first 30 lines
+        # Show first 40 lines
         lines = code.strip().split("\n")
         preview = "\n".join(lines[:40])
         if len(lines) > 40:
             preview += f"\n... ({len(lines) - 40} more lines)"
-        obs = f"Generated Triton kernel: {filepath}\n\n{preview}"
+        lang_tag = "CUDA C++" if lang == "cuda" else "Triton"
+        obs = f"Generated {lang_tag} kernel: {filepath}\n\n{preview}"
         return obs, 1.0, False
 
     def _tool_compile_and_test(self, args: dict) -> tuple[str, float, bool]:
