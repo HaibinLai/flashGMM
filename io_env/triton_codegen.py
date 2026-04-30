@@ -379,6 +379,20 @@ def compile_and_test(task: str, params: dict, filepath: str | None = None,
             max_err = (ref_out - flash_out).abs().max().item()
             mean_err = (ref_out - flash_out).abs().mean().item()
 
+        elif task in ("cosine_similarity", "contrastive_loss"):
+            N, d = params.get("N", 4096), params.get("d", 256)
+            X = torch.randn(N, d, device="cuda")
+            # Try calling with X only; fall back to (X, labels) for contrastive
+            try:
+                ref_out = ref_fn(X)
+                flash_out = flash_fn(X)
+            except TypeError:
+                labels = torch.randint(0, N, (N,), device="cuda")
+                ref_out = ref_fn(X, labels)
+                flash_out = flash_fn(X, labels)
+            max_err = (ref_out - flash_out).abs().max().item()
+            mean_err = (ref_out - flash_out).abs().mean().item()
+
         else:
             return f"No test harness for '{task}'"
 
@@ -466,6 +480,25 @@ def benchmark_kernel(task: str, params: dict, filepath: str | None = None,
             return (X - mean) / torch.sqrt(var + 1e-5) * gamma + beta
 
         ref_fn_actual = naive_layernorm
+    elif task in ("cosine_similarity", "contrastive_loss"):
+        N, d = params.get("N", 4096), params.get("d", 256)
+        X = torch.randn(N, d, device="cuda")
+        try:
+            # Test which signature works
+            _ = ref_fn(X)
+            inputs_flash = (X,)
+            inputs_ref = (X,)
+
+            def naive_cosine(X):
+                Xn = X / X.norm(dim=1, keepdim=True)
+                return Xn @ Xn.T
+
+            ref_fn_actual = naive_cosine
+        except TypeError:
+            labels = torch.randint(0, N, (N,), device="cuda")
+            inputs_flash = (X, labels)
+            inputs_ref = (X, labels)
+            ref_fn_actual = ref_fn
     else:
         return f"No benchmark for '{task}'"
 
