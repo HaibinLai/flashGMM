@@ -17,7 +17,7 @@ Can be driven by an LLM or run as a self-contained demo.
 """
 
 from __future__ import annotations
-import json, io, os, re, sys, contextlib, traceback
+import json, io, os, re, sys, contextlib, traceback, importlib
 from dataclasses import dataclass, field
 
 from io_env.dsl import ComputationGraph, TensorSpec, TilingSpec
@@ -159,6 +159,20 @@ TOOLS = {
         "description": "Get multi-level optimization strategy recommendations for the current operator. Returns suggestions at 4 levels: Algorithm (what method), IO/Fusion (what to fuse), Hardware (what features to use), Data Layout (how to arrange memory). Use BEFORE writing a kernel to plan your approach.",
         "parameters": {},
         "example": '{"tool": "suggest_strategy", "args": {}}',
+    },
+    "debug_correctness": {
+        "description": "Deep-debug a failing kernel: run with small input, compare element-by-element against reference, find the FIRST wrong element, and diagnose the likely cause (wrong twiddle factor, off-by-one index, missing mask, etc.). Use AFTER compile_and_test shows FAIL to understand WHERE and WHY the kernel is wrong.",
+        "parameters": {
+            "n_elements": "int (optional, default 64) — use small N for debugging",
+        },
+        "example": '{"tool": "debug_correctness", "args": {"n_elements": 64}}',
+    },
+    "analyze_platform": {
+        "description": "Show the capabilities and LIMITATIONS of the target code generation platform (Triton or CUDA). Explains what the platform CAN and CANNOT do, so you avoid writing code that will fail. Use BEFORE generating a kernel if you're unsure about platform support.",
+        "parameters": {
+            "lang": "str (optional, default 'triton') — 'triton' or 'cuda'",
+        },
+        "example": '{"tool": "analyze_platform", "args": {"lang": "triton"}}',
     },
 }
 
@@ -442,6 +456,10 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
             return self._tool_analyze_library(args)
         elif tool == "suggest_strategy":
             return self._tool_suggest_strategy(args)
+        elif tool == "debug_correctness":
+            return self._tool_debug_correctness(args)
+        elif tool == "analyze_platform":
+            return self._tool_analyze_platform(args)
         elif tool == "done":
             return self._tool_done()
         else:
@@ -1244,6 +1262,191 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
 
         return "\n".join(lines), 1.0, False
 
+    def _tool_debug_correctness(self, args: dict) -> tuple[str, float, bool]:
+        """Deep-debug a failing kernel: find first wrong element and diagnose cause."""
+        import torch
+        filepath = getattr(self, '_kernel_path', None)
+        if not filepath or not os.path.exists(filepath):
+            return "No kernel to debug. Run generate_kernel first.", 0.0, False
+
+        n_elements = args.get("n_elements", 64)
+        task = self.task_name
+
+        # Load module
+        spec = importlib.util.spec_from_file_location(f"flash_{task}", filepath)
+        mod = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(mod)
+        except Exception as e:
+            return f"COMPILE ERROR: {e}", 0.0, False
+
+        flash_fn = ref_fn = None
+        for name in dir(mod):
+            if name.startswith("flash_"):
+                flash_fn = getattr(mod, name)
+            if name.startswith("reference_"):
+                ref_fn = getattr(mod, name)
+
+        if not flash_fn or not ref_fn:
+            return "Module must define flash_* and reference_* functions.", 0.0, False
+
+        # Construct small inputs
+        torch.manual_seed(42)
+        try:
+            if task == "cross_entropy":
+                N, V = n_elements, min(n_elements * 4, 256)
+                inputs = (torch.randn(N, V, device="cuda"), torch.randint(0, V, (N,), device="cuda"))
+            elif task == "kmeans":
+                N, K, d = n_elements, min(n_elements // 4, 32), 8
+                inputs = (torch.randn(N, d, device="cuda"), torch.randn(K, d, device="cuda"))
+            elif task == "fft":
+                N = min(n_elements, 64)
+                while N & (N - 1): N -= 1  # round down to power of 2
+                if N < 4: N = 4
+                inputs = (torch.randn(N, device="cuda"), torch.zeros(N, device="cuda"))
+            elif task == "softmax":
+                inputs = (torch.randn(n_elements, n_elements, device="cuda"),)
+            elif task == "layernorm":
+                d = min(n_elements, 64)
+                inputs = (torch.randn(n_elements, d, device="cuda"),
+                          torch.ones(d, device="cuda"), torch.zeros(d, device="cuda"))
+            elif task in ("nbody",):
+                inputs = (torch.randn(n_elements, 3, device="cuda"), torch.ones(n_elements, device="cuda"))
+            elif task in ("graph_laplacian", "spmv"):
+                M = n_elements
+                nnz_per_row = 5
+                NNZ = M * nnz_per_row
+                row_ptr = torch.arange(0, (M + 1) * nnz_per_row, nnz_per_row, dtype=torch.int32, device="cuda")[:M + 1]
+                row_ptr[-1] = NNZ
+                col_idx = torch.randint(0, M, (NNZ,), dtype=torch.int32, device="cuda")
+                values = torch.randn(NNZ, device="cuda")
+                x = torch.randn(M, device="cuda")
+                if task == "graph_laplacian":
+                    degree = torch.full((M,), float(nnz_per_row), device="cuda")
+                    inputs = (values, col_idx, row_ptr, degree, x)
+                else:
+                    inputs = (values, col_idx, row_ptr, x)
+            elif task in ("stencil2d",):
+                H = min(n_elements, 32)
+                inputs = (torch.randn(H, H, device="cuda"), 2)
+            elif task in ("conv2d",):
+                inputs = (torch.randn(1, 3, 8, 8, device="cuda"), torch.randn(4, 3, 3, 3, device="cuda"))
+            else:
+                inputs = (torch.randn(n_elements, device="cuda"),)
+
+            ref_out = ref_fn(*inputs)
+            flash_out = flash_fn(*inputs)
+
+            # Handle tuple outputs (FFT returns re, im)
+            if isinstance(ref_out, (list, tuple)):
+                ref_tensors = list(ref_out)
+                flash_tensors = list(flash_out)
+            else:
+                ref_tensors = [ref_out]
+                flash_tensors = [flash_out]
+
+        except Exception as e:
+            return f"DEBUG ERROR: {e}\n{traceback.format_exc()}", 0.0, False
+
+        lines = [f"=== Debug Correctness: {task} (N={n_elements}) ==="]
+
+        all_correct = True
+        for t_idx, (ref_t, flash_t) in enumerate(zip(ref_tensors, flash_tensors)):
+            ref_flat = ref_t.float().flatten()
+            flash_flat = flash_t.float().flatten()
+
+            if ref_flat.shape != flash_flat.shape:
+                lines.append(f"\n  Output {t_idx}: SHAPE MISMATCH ref={ref_flat.shape} flash={flash_flat.shape}")
+                all_correct = False
+                continue
+
+            diff = (ref_flat - flash_flat).abs()
+            max_err = diff.max().item()
+            mean_err = diff.mean().item()
+
+            if max_err < 1e-3:
+                lines.append(f"\n  Output {t_idx}: CORRECT (max_err={max_err:.2e})")
+                continue
+
+            all_correct = False
+            # Find first wrong element
+            wrong_indices = (diff > 1e-3).nonzero(as_tuple=True)[0]
+            first_wrong = wrong_indices[0].item()
+            n_wrong = len(wrong_indices)
+            pct_wrong = n_wrong / len(ref_flat) * 100
+
+            lines.append(f"\n  Output {t_idx}: WRONG")
+            lines.append(f"    Max error: {max_err:.4f}")
+            lines.append(f"    Mean error: {mean_err:.4f}")
+            lines.append(f"    Wrong elements: {n_wrong}/{len(ref_flat)} ({pct_wrong:.0f}%)")
+            lines.append(f"    First wrong at index [{first_wrong}]:")
+            lines.append(f"      Expected: {ref_flat[first_wrong].item():.6f}")
+            lines.append(f"      Got:      {flash_flat[first_wrong].item():.6f}")
+            lines.append(f"      Diff:     {diff[first_wrong].item():.6f}")
+
+            # Show neighborhood
+            start = max(0, first_wrong - 3)
+            end = min(len(ref_flat), first_wrong + 4)
+            lines.append(f"    Neighborhood [{start}:{end}]:")
+            lines.append(f"      Ref:   {[f'{ref_flat[i].item():.4f}' for i in range(start, end)]}")
+            lines.append(f"      Flash: {[f'{flash_flat[i].item():.4f}' for i in range(start, end)]}")
+            lines.append(f"      Diff:  {[f'{diff[i].item():.4f}' for i in range(start, end)]}")
+
+            # Pattern analysis
+            lines.append(f"\n    --- Error Pattern Analysis ---")
+            if pct_wrong > 90:
+                lines.append(f"    ⚠ Almost ALL elements wrong ({pct_wrong:.0f}%)")
+                lines.append(f"      → Likely a fundamental algorithm error (wrong formula, wrong indexing)")
+                if task == "fft":
+                    ratio = flash_flat[first_wrong].item() / (ref_flat[first_wrong].item() + 1e-10)
+                    lines.append(f"      Ratio flash/ref at [{first_wrong}]: {ratio:.4f}")
+                    lines.append(f"      If ratio ≈ N or 1/N: twiddle factor uses wrong N")
+                    lines.append(f"      If pattern is periodic: butterfly stride is wrong")
+            elif pct_wrong > 50:
+                lines.append(f"    ⚠ Majority wrong ({pct_wrong:.0f}%)")
+                lines.append(f"      → Likely wrong butterfly/permutation indexing")
+            elif pct_wrong < 5:
+                lines.append(f"    △ Only a few elements wrong ({pct_wrong:.0f}%)")
+                lines.append(f"      → Likely boundary condition / masking issue")
+            else:
+                lines.append(f"    ⚠ Partial errors ({pct_wrong:.0f}%)")
+                lines.append(f"      → Could be wrong twiddle for specific positions, or accumulation order")
+
+            # Check if errors are periodic
+            if n_wrong >= 4:
+                wrong_list = wrong_indices[:min(20, n_wrong)].tolist()
+                if len(wrong_list) >= 2:
+                    gaps = [wrong_list[i+1] - wrong_list[i] for i in range(len(wrong_list)-1)]
+                    if len(set(gaps)) == 1:
+                        lines.append(f"    Errors are PERIODIC with stride {gaps[0]}")
+                        lines.append(f"      → Likely a specific butterfly stage is wrong")
+
+        if all_correct:
+            lines.append(f"\n  ✓ All outputs match reference within tolerance!")
+
+        torch.cuda.empty_cache()
+        return "\n".join(lines), 0.0, False
+
+    def _tool_analyze_platform(self, args: dict) -> tuple[str, float, bool]:
+        """Explain capabilities and limitations of Triton or CUDA."""
+        lang = args.get("lang", "triton")
+        info = _PLATFORM_INFO.get(lang)
+        if not info:
+            return f"Unknown platform '{lang}'. Available: triton, cuda", 0.0, False
+
+        lines = [f"=== Platform Analysis: {lang} ==="]
+        lines.append(f"\n--- Capabilities ---")
+        for cap in info["capabilities"]:
+            lines.append(f"  ✓ {cap}")
+        lines.append(f"\n--- Limitations (IMPORTANT) ---")
+        for lim in info["limitations"]:
+            lines.append(f"  ✗ {lim}")
+        lines.append(f"\n--- Best Practices ---")
+        for bp in info["best_practices"]:
+            lines.append(f"  → {bp}")
+
+        return "\n".join(lines), 0.0, False
+
     def _tool_done(self) -> tuple[str, float, bool]:
         reward = compute_reward(self.baseline_report, self.current_report)
         obs = self._make_summary()
@@ -1339,6 +1542,78 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
             observation=obs,
             reward=reward,
         ))
+
+
+# ============================================================================
+# Platform Analysis — capabilities and limitations of Triton vs CUDA
+# ============================================================================
+
+_PLATFORM_INFO = {
+    "triton": {
+        "capabilities": [
+            "Automatic vectorized memory loads/stores (tl.load, tl.store with masks)",
+            "Block-level parallelism: each program handles a tile of data",
+            "tl.dot for Tensor Core GEMM (maps to wmma/mma instructions)",
+            "tl.atomic_add, tl.atomic_max for atomic operations",
+            "tl.arange for index generation, tl.where for conditional",
+            "tl.sum, tl.max, tl.min for block-level reductions",
+            "tl.exp, tl.log, tl.sqrt, tl.cos, tl.sin for math",
+            "tl.static_range for compile-time loop unrolling",
+            "Automatic SMEM management (no manual __shared__ declarations)",
+            "Automatic occupancy tuning via num_warps and num_stages",
+        ],
+        "limitations": [
+            "NO arbitrary indexing into register tensors: a[dynamic_idx] does NOT work. "
+            "You cannot shuffle elements within a register vector using data-dependent indices.",
+            "NO warp shuffle primitives (__shfl_xor_sync etc.) — must use tl.store/tl.load through SMEM for cross-lane communication.",
+            "NO explicit shared memory management — Triton manages SMEM automatically for tl.dot operands.",
+            "NO dynamic loop bounds at compile time — for loops must have bounds known at JIT compile time or use tl.static_range.",
+            "tl.dot requires operand shapes to be compile-time constants and multiples of 16.",
+            "NO inline PTX or CUDA intrinsics — cannot use __sincosf, __fmaf_rn etc.",
+            "Cannot read back from a register tensor at arbitrary positions — this makes in-register FFT butterfly IMPOSSIBLE.",
+            "Large kernels with many tl.static_range iterations compile VERY slowly (minutes for 20+ iterations).",
+        ],
+        "best_practices": [
+            "For data shuffling (FFT butterfly, permutation): write to SMEM, __syncthreads, read back in new order.",
+            "For GEMM: use tl.dot with BLOCK_M × BLOCK_K tiles. Triton handles SMEM staging automatically.",
+            "For reductions: tl.sum/tl.max over axis. For cross-block reduction: use atomics or multi-kernel.",
+            "For complex algorithms (FFT, sort): consider CUDA instead — Triton's abstraction is too high-level.",
+            "Keep BLOCK_SIZE as a constexpr. Use num_warps=4-8, num_stages=2-4.",
+            "For FFT specifically: use CUDA SMEM-based butterfly, NOT Triton register manipulation.",
+        ],
+    },
+    "cuda": {
+        "capabilities": [
+            "Full control over shared memory (__shared__, extern __shared__)",
+            "Warp-level primitives: __shfl_xor_sync, __shfl_down_sync, __ballot_sync",
+            "Inline PTX for maximum control: asm volatile()",
+            "Cooperative groups for flexible thread synchronization",
+            "__sincosf, __expf, __fmaf_rn for fast math intrinsics",
+            "Template metaprogramming for compile-time specialization",
+            "Explicit register control via #pragma unroll and asm",
+            "cuBLAS/cuFFT/cuDNN library calls within kernels via device functions",
+            "Dynamic parallelism (launch kernels from kernels)",
+            "Texture memory and surface memory for cached reads",
+        ],
+        "limitations": [
+            "Manual memory management — must explicitly manage SMEM, registers, bank conflicts.",
+            "No automatic occupancy tuning — must manually compute registers/SMEM and choose block size.",
+            "Verbose code — 10× more lines than Triton for same functionality.",
+            "Bank conflicts in SMEM if stride is multiple of 32 (add padding).",
+            "JIT compilation via torch.utils.cpp_extension.load is slow (30-60 seconds).",
+            "No automatic vectorized loads — must use float4/int4 explicitly.",
+            "Thread divergence within warps causes serialization.",
+        ],
+        "best_practices": [
+            "Use SMEM for data reuse and communication between threads.",
+            "Use warp shuffle (__shfl_xor_sync) for butterfly/reduction within 32 threads — zero latency.",
+            "Use __sincosf instead of sinf/cosf — 4× faster, sufficient precision.",
+            "Pad SMEM arrays to avoid bank conflicts: float smem[N + 1] instead of float smem[N].",
+            "Use template parameters for compile-time specialization (tile sizes, radix).",
+            "For FFT: SMEM for tile-local stages, warp shuffle for sub-warp stages, global memory for cross-tile stages.",
+        ],
+    },
+}
 
 
 # ============================================================================

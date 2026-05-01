@@ -272,8 +272,14 @@ def run_llm_react_agent(task: str, model: str = "gpt-5.2",
         elif tool == "compile_and_test" and "PASS" in obs:
             nudge = "Kernel compiled and passed correctness test! Now call 'benchmark_kernel' to measure actual GPU speedup."
         elif tool == "compile_and_test" and "FAIL" in obs:
-            nudge = ("Kernel correctness test FAILED. Analyze the error and write a fixed kernel "
-                     "using generate_kernel with custom_code=<your corrected Triton code>.")
+            if "COMPILE ERROR" in obs:
+                nudge = ("Kernel COMPILE ERROR. Check the error message above. "
+                         "Call 'analyze_platform' to understand what the platform supports, "
+                         "then rewrite the kernel avoiding unsupported features.")
+            else:
+                nudge = ("Kernel correctness test FAILED. Call 'debug_correctness' to find "
+                         "exactly WHERE the first wrong element is and diagnose the likely cause. "
+                         "Do NOT guess — let debug_correctness pinpoint the error.")
         elif tool == "benchmark_kernel":
             # Check if speedup < 1.0
             is_slow = "slower" in obs.lower() or "0." in obs.split("Speedup:")[-1].split("×")[0] if "Speedup:" in obs else False
@@ -377,6 +383,16 @@ def run_llm_react_agent(task: str, model: str = "gpt-5.2",
             nudge = ("Autotune complete! Now call 'benchmark_kernel' to measure the tuned kernel, "
                      "then 'ncu_profile' to verify utilization improved. "
                      "If this is your best result after profiling, you can call 'done'.")
+        elif tool == "debug_correctness":
+            if "CORRECT" in obs or "All outputs match" in obs:
+                nudge = "Debug shows correctness is fine! Call 'benchmark_kernel' to measure performance."
+            else:
+                nudge = ("Debug found the error location and pattern. Read the analysis carefully. "
+                         "Fix the identified issue in your kernel code, then 'generate_kernel' with "
+                         "the corrected custom_code, and 'compile_and_test' again.")
+        elif tool == "analyze_platform":
+            nudge = ("Now you know the platform's capabilities and limitations. "
+                     "Write your kernel respecting these constraints. Use 'generate_kernel' with custom_code.")
         elif tool == "occupancy_analysis":
             if "LOW OCCUPANCY" in obs:
                 nudge = ("Low occupancy detected. Adjust BLOCK_SIZE, num_warps, or reduce register pressure "
