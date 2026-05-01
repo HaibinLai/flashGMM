@@ -150,6 +150,16 @@ TOOLS = {
         "parameters": {},
         "example": '{"tool": "occupancy_analysis", "args": {}}',
     },
+    "analyze_library": {
+        "description": "Analyze WHY the library (cuDNN/cuFFT/cuBLAS) is fast for this operator. Returns the specific algorithmic and hardware techniques the library uses. Use this to understand what your kernel is missing and choose the right optimization strategy.",
+        "parameters": {},
+        "example": '{"tool": "analyze_library", "args": {}}',
+    },
+    "suggest_strategy": {
+        "description": "Get multi-level optimization strategy recommendations for the current operator. Returns suggestions at 4 levels: Algorithm (what method), IO/Fusion (what to fuse), Hardware (what features to use), Data Layout (how to arrange memory). Use BEFORE writing a kernel to plan your approach.",
+        "parameters": {},
+        "example": '{"tool": "suggest_strategy", "args": {}}',
+    },
 }
 
 
@@ -281,13 +291,22 @@ After 'analyze', ALWAYS run 'pre_check' to verify these conditions:
 If pre_check says CAUTION, consider whether IO optimization is the right approach.
 
 ## Required Workflow
-Phase 0 — Pre-Check:
+Phase 0 — Understand the Target:
 1. 'analyze' the baseline operator's IO bottlenecks
 2. 'pre_check' to verify IO optimization is appropriate
-   - If CAUTION: consider alternatives or proceed with care
+3. 'library_ceiling' to see how fast the library (cuDNN/cuFFT/cuBLAS) is
+4. 'analyze_library' to understand WHY the library is fast (what techniques it uses)
+5. 'suggest_strategy' to get multi-level optimization recommendations
 
-Phase 1 — Symbolic IO Analysis:
-3. Apply optimizations (fuse_and_online, fuse_ops) to eliminate materialized intermediates
+Phase 1 — Choose Strategy (MULTI-LEVEL, not just IO):
+  Based on analyze_library + suggest_strategy, pick optimizations at MULTIPLE levels:
+  - Level 1 Algorithm: right method (radix-4 FFT, Winograd conv, merge-based SpMV)
+  - Level 2 IO/Fusion: eliminate intermediates (fuse_and_online, temporal tiling)
+  - Level 3 Hardware: use Tensor Core (tl.dot), warp shuffle, vectorized loads
+  - Level 4 Data Layout: coalescing, bank conflict avoidance
+
+Phase 2 — Symbolic IO Analysis:
+6. Apply optimizations (fuse_and_online, fuse_ops) to eliminate materialized intermediates
 4. 'verify' the symbolic optimization
 
 Phase 2 — Kernel Generation + Testing (THE REAL DELIVERABLE):
@@ -419,6 +438,10 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
             return self._tool_compare_profile(args)
         elif tool == "occupancy_analysis":
             return self._tool_occupancy_analysis(args)
+        elif tool == "analyze_library":
+            return self._tool_analyze_library(args)
+        elif tool == "suggest_strategy":
+            return self._tool_suggest_strategy(args)
         elif tool == "done":
             return self._tool_done()
         else:
@@ -1158,6 +1181,69 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
 
         return "\n".join(lines), 0.0, False
 
+    def _tool_analyze_library(self, args: dict) -> tuple[str, float, bool]:
+        """Analyze why the library implementation is fast for this operator."""
+        info = _LIBRARY_ANALYSIS.get(self.task_name)
+        if not info:
+            return f"No library analysis available for '{self.task_name}'.", 0.0, False
+
+        lines = [
+            f"=== Library Analysis: {self.task_name} ===",
+            f"Library: {info['library']}",
+            f"",
+            f"--- Why is {info['library']} fast? ---",
+        ]
+        for i, technique in enumerate(info['techniques'], 1):
+            lines.append(f"  {i}. {technique['name']}")
+            lines.append(f"     What: {technique['what']}")
+            lines.append(f"     Impact: {technique['impact']}")
+            lines.append(f"     How to implement: {technique['how']}")
+            lines.append("")
+
+        if info.get('key_insight'):
+            lines.append(f"--- Key Insight ---")
+            lines.append(f"  {info['key_insight']}")
+
+        if info.get('our_gap'):
+            lines.append(f"")
+            lines.append(f"--- Our Current Gap ---")
+            for gap in info['our_gap']:
+                lines.append(f"  ✗ {gap}")
+
+        return "\n".join(lines), 1.0, False
+
+    def _tool_suggest_strategy(self, args: dict) -> tuple[str, float, bool]:
+        """Suggest multi-level optimization strategy for the current operator."""
+        strategies = _STRATEGY_DB.get(self.task_name)
+        if not strategies:
+            # Generic fallback
+            strategies = _make_generic_strategy(self.task_name, self.current_report)
+
+        lines = [
+            f"=== Multi-Level Strategy: {self.task_name} ===",
+            f"",
+        ]
+
+        for level in strategies:
+            lines.append(f"Level {level['level']}: {level['name']}")
+            lines.append(f"  Current: {level['current']}")
+            lines.append(f"  Recommended: {level['recommended']}")
+            lines.append(f"  Expected impact: {level['impact']}")
+            if level.get('code_hint'):
+                lines.append(f"  Code hint: {level['code_hint']}")
+            lines.append("")
+
+        # Hardware context
+        hw = self.calc.hw
+        lines.append(f"--- Hardware Context ({hw.name}) ---")
+        lines.append(f"  HBM Bandwidth: {hw.hbm_bandwidth_gbps:.0f} GB/s")
+        lines.append(f"  Peak FP32: {hw.peak_flops_tflops:.1f} TFLOPS")
+        lines.append(f"  SMEM/SM: {hw.smem_per_sm_kb:.0f} KB")
+        lines.append(f"  L2 Cache: {hw.l2_cache_mb:.0f} MB")
+        lines.append(f"  Balance point: {hw.balance_point:.1f} FLOP/Byte")
+
+        return "\n".join(lines), 1.0, False
+
     def _tool_done(self) -> tuple[str, float, bool]:
         reward = compute_reward(self.baseline_report, self.current_report)
         obs = self._make_summary()
@@ -1253,6 +1339,320 @@ Action: {{"tool": "<tool_name>", "args": {{...}}}}
             observation=obs,
             reward=reward,
         ))
+
+
+# ============================================================================
+# Library Analysis Knowledge Base — WHY each library is fast
+# ============================================================================
+
+_LIBRARY_ANALYSIS = {
+    "fft": {
+        "library": "cuFFT",
+        "techniques": [
+            {"name": "Mixed-radix decomposition",
+             "what": "Use radix-2/4/8/16 instead of pure radix-2. N=1M=2^20: radix-8 needs only 7 stages vs 20 for radix-2.",
+             "impact": "~2.5× fewer global HBM passes",
+             "how": "Implement radix-4 butterfly: 4 inputs, 3 twiddle multiplies, 8 adds. Process 4 elements per butterfly instead of 2."},
+            {"name": "Warp-level butterfly (register shuffle)",
+             "what": "Use __shfl_xor_sync for butterfly within a warp — zero shared memory access, zero bank conflicts.",
+             "impact": "~2× faster for small stages (log2(32)=5 stages done entirely in registers)",
+             "how": "For stages with stride ≤ 16: use tl.math or inline PTX __shfl_xor_sync(mask, val, stride)."},
+            {"name": "Precomputed twiddle factors",
+             "what": "Store twiddle factors (cos/sin) in constant memory or precomputed table, not computed at runtime.",
+             "impact": "Eliminates cosf/sinf calls (each ~20 cycles vs ~4 cycles for memory load)",
+             "how": "Precompute W[k] = exp(-2πi·k/N) for each stage, store in constant memory or global memory."},
+            {"name": "Large SMEM tile + register blocking",
+             "what": "Each thread processes multiple elements (4-8), tile of 4096+ elements in SMEM.",
+             "impact": "More stages fused in SMEM → fewer global passes",
+             "how": "A100 has 164KB SMEM/SM. Tile of 4096 complex = 32KB. Can fuse log2(4096)=12 stages in SMEM."},
+        ],
+        "key_insight": "cuFFT's speed comes from minimizing global memory passes via higher radix + larger tiles, NOT from faster arithmetic.",
+        "our_gap": [
+            "Only radix-2 (20 passes for N=1M vs cuFFT's ~7)",
+            "Runtime cosf/sinf instead of precomputed twiddle",
+            "SMEM tile only 1024 (fuses 10 stages), could be 4096 (fuses 12)",
+            "No warp shuffle — all butterfly through SMEM",
+        ],
+    },
+    "conv2d": {
+        "library": "cuDNN",
+        "techniques": [
+            {"name": "Winograd transform (for 3×3)",
+             "what": "F(4,3) Winograd reduces 3×3 conv multiplications by 2.25×. Transform input+filter to Winograd domain, do element-wise multiply, transform back.",
+             "impact": "2.25× fewer FLOPs for 3×3 convolutions",
+             "how": "Implement Winograd F(2,3) or F(4,3) tile transform matrices. Requires pre/post transform passes."},
+            {"name": "Implicit GEMM with Tensor Core",
+             "what": "Compute im2col on-the-fly inside the GEMM tile, use WMMA/mma for Tensor Core FP16/TF32 matmul.",
+             "impact": "16× higher compute throughput (TC vs CUDA cores) + zero im2col materialization",
+             "how": "Use tl.dot or WMMA intrinsics. Gather input patches into SMEM registers per tile."},
+            {"name": "Software pipelining",
+             "what": "Overlap next tile's global memory load with current tile's GEMM compute using double-buffered SMEM.",
+             "impact": "Hides memory latency, achieving 80%+ of peak compute",
+             "how": "Use num_stages=2-4 in Triton, or manual double-buffering with cp.async in CUDA."},
+            {"name": "cudnnFindAlgorithm auto-selection",
+             "what": "Test multiple algorithms (direct, Winograd, FFT-based, implicit GEMM) and pick the fastest for given shapes.",
+             "impact": "Always uses the best algorithm for each (N,C,H,W,K) configuration",
+             "how": "Benchmark multiple implementations and cache the winner."},
+        ],
+        "key_insight": "cuDNN's speed comes from Winograd (fewer FLOPs) + Tensor Core (higher throughput) + auto-tuning (right algorithm per shape).",
+        "our_gap": [
+            "No Winograd — direct convolution only",
+            "No Tensor Core — FP32 scalar GEMM",
+            "No software pipelining — sequential load+compute",
+            "No algorithm selection — fixed implicit im2col",
+        ],
+    },
+    "kmeans": {
+        "library": "cuBLAS (torch.cdist → cublasGemmEx)",
+        "techniques": [
+            {"name": "Tensor Core GEMM",
+             "what": "cdist decomposes as ||x-c||² = ||x||² + ||c||² - 2·x@c^T. The x@c^T is a cuBLAS GEMM using Tensor Core.",
+             "impact": "16× compute throughput vs CUDA core FP32",
+             "how": "Use tl.dot for the X@C^T matmul. Compute ||x||² and ||c||² separately, combine."},
+            {"name": "Tiled GEMM + epilogue fusion",
+             "what": "cuBLAS tiles the GEMM optimally, then a separate argmin kernel reduces rows.",
+             "impact": "Near-peak GEMM throughput",
+             "how": "Fuse: tl.dot for distance tiles + online argmin per tile. This eliminates the N×K matrix."},
+        ],
+        "key_insight": "The key is preserving GEMM structure while adding online reduction. tl.dot is essential.",
+        "our_gap": [
+            "Scalar template destroys GEMM parallelism (0.07×)",
+            "tl.dot template restores it (1.44×) but tile sizes could be larger",
+        ],
+    },
+    "softmax": {
+        "library": "ATen (PyTorch torch.softmax)",
+        "techniques": [
+            {"name": "Fused 2-pass kernel",
+             "what": "ATen softmax is already a fused kernel: pass1 max+sumexp, pass2 normalize. No intermediate materialization.",
+             "impact": "Already IO-optimal — same algorithm as Flash",
+             "how": "Our Flash softmax uses the same approach. Difference is ATen's is highly tuned."},
+            {"name": "Vectorized loads (float4)",
+             "what": "ATen uses 128-bit vectorized loads (float4) for coalesced memory access.",
+             "impact": "4× effective bandwidth for sequential access patterns",
+             "how": "In Triton: use BLOCK_SIZE that's a multiple of 4 and ensure contiguous access."},
+            {"name": "Warp-level reduction",
+             "what": "Row max and sum are computed using warp shuffle, not shared memory.",
+             "impact": "Lower latency reduction, better for short rows",
+             "how": "Triton handles this automatically with tl.max/tl.sum for small BLOCK_SIZE."},
+        ],
+        "key_insight": "torch.softmax is already Flash-optimized. Beating it requires better vectorization and warp-level tuning, not algorithmic changes.",
+        "our_gap": [
+            "Same algorithm but less tuned launch config",
+            "Small matrices fit in L2 — IO optimization irrelevant",
+        ],
+    },
+    "spmv": {
+        "library": "cuSPARSE",
+        "techniques": [
+            {"name": "CSR-Adaptive (row-length aware)",
+             "what": "Short rows (nnz<32): one thread per row. Medium rows: one warp. Long rows: one block. Auto-selected.",
+             "impact": "Optimal parallelism for any sparsity pattern",
+             "how": "Partition rows by nnz length, launch different kernels or use dynamic parallelism."},
+            {"name": "Merge-based partition",
+             "what": "Partition work by NNZ count (not row count). Each thread block gets equal NNZ regardless of row structure.",
+             "impact": "Perfect load balance across thread blocks",
+             "how": "Use merge_path to find (row, nnz) boundary for each block. Process heterogeneous rows."},
+            {"name": "Vectorized value/column loads",
+             "what": "Load 2-4 consecutive CSR entries at once using vectorized loads.",
+             "impact": "Higher memory throughput for the sequential CSR data",
+             "how": "Align CSR arrays and use float2/float4 loads for values and int2/int4 for col_idx."},
+        ],
+        "key_insight": "SpMV performance depends on matching parallelism to row length distribution. Uniform strategies (thread-per-row or warp-per-row) waste resources.",
+        "our_gap": [
+            "Fixed warp-per-row — wastes lanes for short rows",
+            "No row-length adaptive strategy",
+            "No merge-based load balancing",
+        ],
+    },
+    "stencil2d": {
+        "library": "none (no standard library)",
+        "techniques": [
+            {"name": "Temporal tiling (our approach)",
+             "what": "Fuse S iterations in SMEM, reducing HBM passes by S×.",
+             "impact": "S× fewer HBM round-trips (S=4-8 typical)",
+             "how": "Load (BH+2S)×(BW+2S) halo, iterate S times in SMEM, write BH×BW."},
+            {"name": "Overlapped tiling / diamond tiling",
+             "what": "Reduce halo overhead by using diamond-shaped tiles instead of rectangular.",
+             "impact": "Less redundant halo data loaded",
+             "how": "Advanced: requires non-trivial tile shape computation."},
+        ],
+        "key_insight": "Stencil optimization is about minimizing HBM passes per iteration. Temporal tiling is the primary technique.",
+        "our_gap": ["Current approach is already effective (4.7× speedup)"],
+    },
+    "nbody": {
+        "library": "none (no standard library)",
+        "techniques": [
+            {"name": "SMEM tiling (our approach)",
+             "what": "Tile particles into SMEM, compute pairwise forces from SMEM instead of HBM.",
+             "impact": "Eliminates N×N HBM traffic → O(N²/BN) SMEM loads",
+             "how": "Each block loads BN source particles, all target threads accumulate."},
+            {"name": "Barnes-Hut / FMM (algorithmic)",
+             "what": "Approximate distant interactions → O(N log N) instead of O(N²).",
+             "impact": "Asymptotically faster for large N",
+             "how": "Build octree, compute multipole expansion for distant groups."},
+        ],
+        "key_insight": "Direct N-body is inherently O(N²). SMEM tiling optimizes the constant. For N>100K, need hierarchical methods.",
+        "our_gap": ["Direct method only — no Barnes-Hut/FMM for large N"],
+    },
+    "cross_entropy": {
+        "library": "ATen F.cross_entropy",
+        "techniques": [
+            {"name": "Our Flash kernel is already faster",
+             "what": "Single-pass online logsumexp + gather. F.cross_entropy uses a similar approach but our Triton version is faster.",
+             "impact": "Our kernel: 0.34ms vs ATen: 1.24ms = 3.6× faster",
+             "how": "Already optimal. Online logsumexp over vocab tiles."},
+        ],
+        "key_insight": "This is a success case — our Flash approach already beats the library.",
+        "our_gap": [],
+    },
+    "layernorm": {
+        "library": "ATen F.layer_norm",
+        "techniques": [
+            {"name": "Our Flash kernel is already faster",
+             "what": "2-pass Welford + normalize. Our Triton version achieves higher bandwidth utilization.",
+             "impact": "Our kernel: 0.42ms vs ATen: 0.51ms = 1.2× faster",
+             "how": "Already optimal. 2-pass Welford with large BLOCK_SIZE."},
+        ],
+        "key_insight": "This is a success case — our Flash approach already beats the library.",
+        "our_gap": [],
+    },
+    "graph_laplacian": {
+        "library": "none (custom fused kernel)",
+        "techniques": [
+            {"name": "Fused SpMV + diag (our approach)",
+             "what": "y[i] = d[i]*x[i] - sum_j(A[i,j]*x[j]) in one kernel pass.",
+             "impact": "Eliminates Ax intermediate, 1.18× speedup",
+             "how": "Per-row: accumulate Ax in register, combine with D*x, write once."},
+        ],
+        "key_insight": "Fusion saves one kernel launch and one HBM round-trip for Ax.",
+        "our_gap": ["Could benefit from CSR-Adaptive row parallelism (same as SpMV)"],
+    },
+}
+
+
+# ============================================================================
+# Strategy Database — multi-level optimization recommendations per operator
+# ============================================================================
+
+_STRATEGY_DB = {
+    "fft": [
+        {"level": 1, "name": "Algorithm",
+         "current": "Radix-2 Cooley-Tukey (log2(N) passes)",
+         "recommended": "Radix-4 or Radix-8 (log4(N) or log8(N) passes)",
+         "impact": "2-3× fewer global passes → directly reduces HBM traffic",
+         "code_hint": "Radix-4 butterfly: 4 inputs → 3 twiddle muls + 8 adds (vs radix-2: 2 inputs → 1 mul + 2 adds)"},
+        {"level": 2, "name": "IO/Fusion",
+         "current": "Fuse 10 stages in SMEM (TILE=1024)",
+         "recommended": "Fuse 12 stages in SMEM (TILE=4096, 32KB) + precomputed twiddle in constant memory",
+         "impact": "2 fewer global passes + eliminate sin/cos computation",
+         "code_hint": "A100 SMEM=164KB. 4096 complex float = 32KB. Precompute twiddle W[k]=exp(-2πi·k/N)."},
+        {"level": 3, "name": "Hardware",
+         "current": "SMEM butterfly with __syncthreads",
+         "recommended": "Warp shuffle for stages with stride ≤ 16 (5 stages), SMEM for larger strides",
+         "impact": "Zero bank conflict for small stages, ~30% faster inner loop",
+         "code_hint": "__shfl_xor_sync(0xffffffff, val, stride) for butterfly exchange within warp."},
+        {"level": 4, "name": "Data Layout",
+         "current": "Separate real/imaginary arrays",
+         "recommended": "Interleaved real/imaginary (struct of arrays → array of structs for coalescing)",
+         "impact": "Better memory coalescing for butterfly access patterns",
+         "code_hint": "Store as float2 (re, im) pairs. Each thread loads one complex number with one 8-byte load."},
+    ],
+    "conv2d": [
+        {"level": 1, "name": "Algorithm",
+         "current": "Direct implicit im2col + scalar GEMM",
+         "recommended": "Winograd F(4,3) for 3×3 kernels, or implicit GEMM with Tensor Core for general",
+         "impact": "Winograd: 2.25× fewer FLOPs. TC: 16× compute throughput.",
+         "code_hint": "For Winograd: BT·d·B transform (4×4 tile), G·g·GT filter transform, element-wise mul, AT·m·A inverse."},
+        {"level": 2, "name": "IO/Fusion",
+         "current": "Implicit im2col (good — no materialization)",
+         "recommended": "Keep implicit im2col. Add software pipelining (double-buffered SMEM).",
+         "impact": "Overlaps compute with memory → 80%+ utilization",
+         "code_hint": "num_stages=2 in Triton, or manual cp.async + double-buffer in CUDA."},
+        {"level": 3, "name": "Hardware",
+         "current": "FP32 scalar multiply-add",
+         "recommended": "TF32 Tensor Core via tl.dot (automatic in Triton with float32 inputs on A100)",
+         "impact": "8× compute throughput for GEMM tiles",
+         "code_hint": "tl.dot(a, b) with float32 inputs on A100 automatically uses TF32 Tensor Core."},
+        {"level": 4, "name": "Data Layout",
+         "current": "NCHW input",
+         "recommended": "NHWC for better Tensor Core alignment (if using TC GEMM)",
+         "impact": "Enables 128-bit aligned loads for TC operands",
+         "code_hint": "input = input.to(memory_format=torch.channels_last)"},
+    ],
+    "spmv": [
+        {"level": 1, "name": "Algorithm",
+         "current": "Fixed warp-per-row",
+         "recommended": "CSR-Adaptive: thread-per-row (short), warp-per-row (medium), block-per-row (long)",
+         "impact": "Matches parallelism to row length → no wasted lanes",
+         "code_hint": "Classify rows by nnz: <32→thread, 32-512→warp, >512→block. Launch separate kernels."},
+        {"level": 2, "name": "IO/Fusion",
+         "current": "Random x[col_idx] gather",
+         "recommended": "Cache x tiles in SMEM for banded matrices. For general: texture cache for x.",
+         "impact": "Reduces random HBM reads for x vector",
+         "code_hint": "If matrix has bandwidth B: load x[col_start:col_start+BN] into SMEM."},
+        {"level": 3, "name": "Hardware",
+         "current": "Warp shuffle reduction only",
+         "recommended": "Vectorized CSR loads (float2/float4) + L1 cache hints",
+         "impact": "Higher bandwidth utilization for sequential CSR data",
+         "code_hint": "Load values[j:j+4] as float4, col_idx[j:j+4] as int4."},
+        {"level": 4, "name": "Data Layout",
+         "current": "Standard CSR",
+         "recommended": "Padded CSR (pad short rows to warp boundary) or SELL-C-sigma (sorted + padded)",
+         "impact": "Eliminates lane divergence within warps",
+         "code_hint": "Sort rows by nnz, pad to multiple of 32, store in SELL-C format."},
+    ],
+    "kmeans": [
+        {"level": 1, "name": "Algorithm",
+         "current": "tl.dot tiled GEMM + online argmin (good)",
+         "recommended": "Keep current. Consider Tensor Core BF16 for 2× throughput.",
+         "impact": "BF16 TC: 2× compute throughput, slight precision trade-off",
+         "code_hint": "Cast X and C to bfloat16 before tl.dot. Keep accumulator in float32."},
+        {"level": 2, "name": "IO/Fusion",
+         "current": "Online argmin eliminates N×K matrix (good)",
+         "recommended": "Keep. IO optimization already effective.",
+         "impact": "Already near optimal for this dimension.",
+         "code_hint": "N/A — already fused."},
+        {"level": 3, "name": "Hardware",
+         "current": "FP32 tl.dot on A100",
+         "recommended": "TF32 or BF16 tl.dot for Tensor Core (A100 supports TF32 automatically for tl.dot with fp32)",
+         "impact": "Should already use TF32. Verify with NCU tensor_cycles > 0.",
+         "code_hint": "tl.dot(a, b, allow_tf32=True) — default on A100."},
+        {"level": 4, "name": "Data Layout",
+         "current": "Row-major X (N,d) and C (K,d)",
+         "recommended": "Keep row-major. Ensure BLOCK_M × BK tile fits SMEM well.",
+         "impact": "Minimal — already coalesced.",
+         "code_hint": "Tune BLOCK_M=64-128, BK=32-64 for best occupancy."},
+    ],
+}
+
+
+def _make_generic_strategy(task: str, report) -> list:
+    """Generate generic strategy when no specific one exists."""
+    strategies = []
+    if report and report.bottleneck == "memory-bound":
+        strategies.append({
+            "level": 2, "name": "IO/Fusion",
+            "current": "Materialized intermediates",
+            "recommended": "Fuse operations to eliminate HBM round-trips",
+            "impact": f"Up to {report.arithmetic_intensity:.1f}× if fully fused",
+        })
+    if report and report.pre_check and report.pre_check.has_gemm_structure:
+        strategies.append({
+            "level": 3, "name": "Hardware",
+            "current": "Unknown compute pattern",
+            "recommended": "Use tl.dot for GEMM structure to enable Tensor Core",
+            "impact": "Up to 16× compute throughput",
+            "code_hint": "tl.dot(a_tile, b_tile.T) inside tile loop",
+        })
+    if not strategies:
+        strategies.append({
+            "level": 2, "name": "IO/Fusion",
+            "current": "Standard implementation",
+            "recommended": "Analyze with 'analyze' tool first, then fuse_and_online",
+            "impact": "Depends on materialization analysis",
+        })
+    return strategies
 
 
 # ============================================================================

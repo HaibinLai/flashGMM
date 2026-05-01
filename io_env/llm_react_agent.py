@@ -252,8 +252,17 @@ def run_llm_react_agent(task: str, model: str = "gpt-5.2",
                          "IO optimization may not yield speedup for this operator. "
                          "Consider the recommendations before proceeding.")
             else:
-                nudge = ("Pre-check passed. Proceed with IO optimization. "
-                         "Apply fuse_and_online or fuse_ops to eliminate materialized intermediates.")
+                nudge = ("Pre-check passed. Before writing code, first understand the target: "
+                         "call 'library_ceiling' to see how fast the library is, "
+                         "then 'analyze_library' to understand WHY it's fast, "
+                         "then 'suggest_strategy' to get multi-level optimization recommendations.")
+        elif tool == "analyze_library":
+            nudge = ("Now you understand the library's techniques. Call 'suggest_strategy' to get "
+                     "concrete multi-level optimization recommendations, then proceed with optimization.")
+        elif tool == "suggest_strategy":
+            nudge = ("Strategy recommendations received. Now apply the optimizations: "
+                     "first symbolic IO analysis (fuse_and_online/fuse_ops), then 'verify', "
+                     "then 'generate_kernel' incorporating ALL levels of the strategy (not just IO).")
         elif tool == "verify" and "ALL PASSED" in obs:
             nudge = ("Verification passed! Now you MUST generate an actual Triton GPU kernel. "
                      "Call 'generate_kernel' to create the kernel, then 'compile_and_test' to verify it, "
