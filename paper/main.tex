@@ -258,15 +258,28 @@ The \texttt{tiled\_gemm\_online\_reduce} skill discovered on KMeans transfers to
 \caption{Cross-operator skill transfer results.}
 \label{tab:transfer}
 \small
-\begin{tabular}{llcc}
+\begin{tabular}{llccc}
 \toprule
-Skill Source & Transfer Target & w/o Skill & w/ Skill \\
+Skill Source & Transfer Target & w/o Skill & w/ Skill & Layer \\
 \midrule
-KMeans & N-Body & 0.07$\times$ & \textbf{2.19$\times$} \\
-KMeans & GMM E-step & 0.11$\times$ & \textbf{1.44$\times$} \\
-CrossEntropy & LayerNorm & --- & \textbf{4.58$\times$} \\
+\multicolumn{5}{l}{\emph{Strategy transfer (same pattern, different op)}} \\
+CrossEntropy & LayerNorm & --- & \textbf{4.87$\times$} & Strategy \\
+KMeans & N-Body (CUDA) & --- & \textbf{2.19$\times$} & Strategy \\
+KMeans & GMM E-step & 0.11$\times$ & \textbf{1.44$\times$} & Strategy \\
+\midrule
+\multicolumn{5}{l}{\emph{Implementation transfer (copy code template)}} \\
+KMeans (tl.dot) & N-Body (Triton) & 2.19$\times$ & 0.68$\times$ & Impl.\ \\
 \bottomrule
 \end{tabular}
+
+\vspace{4pt}
+\noindent\small
+Strategy transfer works across operators (online reduce: CE$\to$LN;
+tiled GEMM: KMeans$\to$N-Body).  However, directly copying the
+KMeans tl.dot \emph{implementation} to N-Body \emph{regresses}
+($2.19\times \to 0.68\times$) because N-Body has $d{=}3$
+(ill-suited for GEMM tiles).  This validates the two-level skill
+decomposition.
 \end{table}
 
 \subsection{Skill Coverage (Claim 3)}
