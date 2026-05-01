@@ -276,6 +276,13 @@ def run_llm_react_agent(task: str, model: str = "gpt-5.2",
                     try: speedup_val = float(bline.split(":")[-1].strip().rstrip("×"))
                     except ValueError: pass
 
+            # Check exploration state
+            tools_used = set(h.tool for h in env.history) if hasattr(env, 'history') else set()
+            has_profiled = "ncu_profile" in tools_used
+            has_ceiling = "library_ceiling" in tools_used
+            has_autotuned = "autotune_kernel" in tools_used
+            fully_explored = has_profiled and has_ceiling and has_autotuned
+
             if is_regression:
                 nudge = ("⚠ Your new kernel is SLOWER than the previous best! "
                          "The environment auto-rolled back to the best kernel. "
@@ -295,13 +302,27 @@ def run_llm_react_agent(task: str, model: str = "gpt-5.2",
                          "If compute util is low, there may be a parallelism issue to fix. "
                          "Call 'library_ceiling' to see how far from optimal.")
             else:
-                nudge = (f"Great speedup ({speedup_val:.2f}×)! But don't stop yet — "
-                         "call 'ncu_profile' to check bandwidth utilization, "
-                         "then 'library_ceiling' to see the ceiling, "
-                         "then try 'autotune_kernel' to squeeze out more performance. "
-                         "Only call 'done' after you've profiled AND tried autotune.")
+                if fully_explored:
+                    nudge = (f"Speedup {speedup_val:.2f}× and you've completed full exploration "
+                             "(ncu_profile + library_ceiling + autotune). Call 'done' with final summary.")
+                else:
+                    nudge = (f"Great speedup ({speedup_val:.2f}×)! But don't stop yet — "
+                             "call 'ncu_profile' to check bandwidth utilization, "
+                             "then 'library_ceiling' to see the ceiling, "
+                             "then try 'autotune_kernel' to squeeze out more performance. "
+                             "Only call 'done' after you've profiled AND tried autotune.")
         elif tool == "ncu_profile":
-            if "under-utilized" in obs.lower():
+            # Check how many profiling tools have been used already
+            tools_used = set(h.tool for h in env.history) if hasattr(env, 'history') else set()
+            has_autotuned = "autotune_kernel" in tools_used
+            has_ceiling = "library_ceiling" in tools_used
+            profiled_twice = sum(1 for h in env.history if h.tool == "ncu_profile") >= 2 if hasattr(env, 'history') else False
+
+            if profiled_twice and has_autotuned and has_ceiling:
+                # Agent has done full exploration — guide to done
+                nudge = ("You've completed the full profiling loop: ncu_profile, library_ceiling, "
+                         "autotune, re-benchmark, and re-profile. Call 'done' with your final summary.")
+            elif "under-utilized" in obs.lower():
                 nudge = ("Kernel is UNDER-UTILIZED (low bandwidth AND compute). "
                          "This is a structural problem. Call 'compare_profile' to see what changed "
                          "vs baseline, then 'retrieve_pattern' to learn the correct pattern. "
@@ -352,7 +373,9 @@ def run_llm_react_agent(task: str, model: str = "gpt-5.2",
                 nudge = ("Low occupancy detected. Adjust BLOCK_SIZE, num_warps, or reduce register pressure "
                          "in your kernel, then regenerate with 'generate_kernel'.")
             else:
-                nudge = "Occupancy is acceptable. Focus on other optimization dimensions."
+                nudge = ("Occupancy is acceptable. You've now completed profiling. "
+                         "If you've already run ncu_profile + library_ceiling + autotune, "
+                         "call 'done' with your final analysis and results.")
         elif tool == "benchmark":
             nudge = ("That was the Python-level benchmark. Now generate the REAL Triton kernel: "
                      "call 'generate_kernel', then 'compile_and_test', then 'benchmark_kernel'.")
