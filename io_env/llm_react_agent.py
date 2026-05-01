@@ -128,29 +128,48 @@ def parse_action(response: str) -> tuple[str, str, dict]:
 
     Returns: (thought, tool_name, args_dict)
     """
-    # Extract thought
+    # Extract thought (up to first Action: line only)
     thought_match = re.search(r'Thought:\s*(.*?)(?=\nAction:|\Z)', response, re.DOTALL)
     thought = thought_match.group(1).strip() if thought_match else response.strip()
+    # Truncate thought if it contains simulated observations
+    if '=== Observation' in thought:
+        thought = thought.split('=== Observation')[0].strip()
 
-    # Extract action JSON
-    action_match = re.search(r'Action:\s*(\{.*\})', response, re.DOTALL)
-    if not action_match:
-        # Try to find any JSON object in the response
-        json_match = re.search(r'\{[^{}]*"tool"[^{}]*\}', response)
-        if json_match:
-            action_match = json_match
+    # Extract FIRST action JSON only (handle nested braces for args:{})
+    action_match = None
+    m = re.search(r'Action:\s*(\{)', response)
+    if m:
+        # Find matching closing brace
+        start = m.start(1)
+        depth = 0
+        for i in range(start, len(response)):
+            if response[i] == '{': depth += 1
+            elif response[i] == '}': depth -= 1
+            if depth == 0:
+                action_str = response[start:i+1]
+                try:
+                    action = json.loads(action_str)
+                    return thought, action.get("tool", ""), action.get("args", {})
+                except json.JSONDecodeError:
+                    pass
+                break
 
+    # Fallback: try JSON in markdown code block
+    action_match = re.search(r'```(?:json)?\s*(\{[^`]*"tool"[^`]*\})\s*```', response, re.DOTALL)
     if action_match:
         try:
-            action_str = action_match.group(1) if hasattr(action_match, 'group') else action_match.group(0)
-            action = json.loads(action_str)
+            action = json.loads(action_match.group(1))
             return thought, action.get("tool", ""), action.get("args", {})
         except json.JSONDecodeError:
             pass
 
     # Fallback: try to detect intent from text
+    # Be STRICT — only match if it's clearly the intended action, not just mentioned
     lower = response.lower()
-    if "done" in lower and ("complete" in lower or "finish" in lower):
+    if lower.strip().endswith('"done"') or lower.strip().endswith("'done'"):
+        return thought, "done", {}
+    # Check for Action: done or Action: {"tool": "done"} as substring
+    if re.search(r'action:\s*\{\s*"tool"\s*:\s*"done"', lower):
         return thought, "done", {}
 
     return thought, "", {}

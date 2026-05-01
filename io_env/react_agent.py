@@ -406,8 +406,13 @@ Decision tree based on profiling results:
 - ONLY call 'done' after you have profiling data confirming you're near the hardware limit.
 
 ## Response Format
-Thought: <your reasoning>
+IMPORTANT: Output EXACTLY ONE Action per response. Do NOT simulate observations or plan multiple steps ahead.
+Do NOT output fake observations — the environment will provide real observations after each action.
+
+Thought: <your reasoning about what to do NEXT (one step only)>
 Action: {{"tool": "<tool_name>", "args": {{...}}}}
+
+STOP after the Action line. Do NOT continue with more Thought/Action pairs or simulated observations.
 """
         return prompt
 
