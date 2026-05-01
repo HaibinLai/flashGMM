@@ -134,19 +134,23 @@ class AtomicFreeFlashGMM:
             N, K, d, BK, BLOCK_N,
         )
 
-        # Pass 2: choose strategy based on K
+        # Pass 2: choose strategy based on K and N
         n_k_blocks = (K + BK - 1) // BK
-        if n_k_blocks >= 8:  # enough K-blocks to fill SMs → atomic-free
+        n_n_blocks = (N + BLOCK_N - 1) // BLOCK_N
+
+        if n_k_blocks >= 8 and N <= 500_000:
+            # Atomic-free: each block owns K-tile, streams all N
             grid2 = (n_k_blocks,)
             _atomic_free_accum_kernel[grid2](
                 X, X_sq, inv_var, mu_iv, quad_mu, log_coeff, log_normalizer,
                 n_k, s_k, sq_k,
                 N, K, d, BK, BLOCK_N,
             )
-        else:  # small K → use atomic version for parallelism
+        else:
+            # Atomic version: better for small K or very large N
             from flash_gmm_v3 import _flash_accum_stats_bf16_kernel
             n_k.zero_(); s_k.zero_(); sq_k.zero_()
-            grid2 = (n_k_blocks, (N + BLOCK_N - 1) // BLOCK_N)
+            grid2 = (n_k_blocks, n_n_blocks)
             _flash_accum_stats_bf16_kernel[grid2](
                 X, X_sq, inv_var, mu_iv, quad_mu, log_coeff, log_normalizer,
                 n_k, s_k, sq_k,
