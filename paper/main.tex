@@ -13,7 +13,7 @@
 \sloppy
 \emergencystretch=3em
 
-\title{Learning Optimization Skills for GPU Kernels: A Knowledge--Environment--Objective Framework}
+\title[Learning Optimization Skills for GPU Kernels]{Learning Optimization Skills for GPU Kernels: A Knowledge--Environment--Objective Framework}
 
 \author{Haibin Lai}
 \affiliation{%
@@ -26,7 +26,7 @@
 \begin{document}
 
 \begin{abstract}
-Optimizing GPU kernels for high-performance computing (HPC) workloads remains a labor-intensive process that relies on expert knowledge accumulated over years of practice. Existing approaches either encode this knowledge as static rules or resort to brute-force search, failing to capture the reusable structure inherent in optimization strategies. We observe that a small set of \emph{optimization skills}---transferable patterns such as tiled GEMM with online reduction, temporal blocking, and SMEM-cached streaming---can cover a large fraction of the optimization space across diverse computational patterns. Based on this insight, we propose a framework that automatically \emph{discovers} optimization skills from profiling-guided optimization trajectories, \emph{abstracts} them into reusable (condition, pattern, transformation) triples, and \emph{transfers} them to new kernels. We formalize this through a Knowledge--Environment--Objective (KEO) cognitive architecture where an LLM-driven agent interacts with hardware profilers (NCU), domain knowledge (papers/libraries), and multi-scale benchmarks. Experiments on 10~operators covering all 7 Berkeley Dwarfs on an NVIDIA A100 GPU show that 5 automatically discoverable skills achieve 1.2--6.0$\times$ speedup over materialized baselines, and that skills learned from one operator transfer to unseen operators with minimal adaptation. As a complete end-to-end case study, we apply the framework to derive Flash-GMM, an IO-aware Gaussian Mixture Model EM solver that achieves up to $1.56\times$ speedup and $32\times$ VRAM reduction over standard PyTorch GPU GMM, with an additional $\sim\!10\times$ NCU-guided kernel-internal refinement obtained purely by reusing skills already in the library.
+Optimizing GPU kernels for high-performance computing (HPC) workloads remains a labor-intensive process that relies on implicit expert knowledge. We discover that this knowledge has a \emph{two-level structure}: a compact set of optimization \emph{strategies} (e.g., tiled GEMM with online reduction, temporal blocking, SMEM-cached streaming) that transfer across operators, and a longer tail of operator-specific \emph{implementations} (e.g., correct butterfly indexing for FFT) that must be supplied as verified code. We formalize this through a Knowledge--Environment--Objective (KEO) framework where an LLM-driven agent interacts with hardware profilers (NVIDIA Nsight Compute), domain knowledge, and multi-scale benchmarks. Experiments on 10~operators covering all 7 Berkeley Dwarfs on an NVIDIA A100 GPU show that 5 strategies cover 8~operators achieving 1.2--6.0$\times$ speedup, that strategy-level transfer succeeds across operators (3/3) while implementation-level transfer fails (1/1), and that NCU-guided diagnosis turns a stuck 0.07$\times$ kernel into a 1.44$\times$ success in one iteration. A complete end-to-end case study on Flash-GMM achieves 1.56$\times$ speedup and 32$\times$ VRAM reduction, with $\sim\!10\times$ NCU-guided kernel refinement reusing existing skills.
 \end{abstract}
 
 \keywords{GPU optimization, kernel compilation, optimization skills, LLM agents, hardware profiling}
@@ -87,9 +87,62 @@ We evaluate on 10 operators spanning all 7 Berkeley Dwarfs (dense/sparse linear 
 \section{Background and Motivation}
 % ============================================================================
 
+\subsection{GPU Memory Hierarchy and the Roofline Model}
+\label{sec:bg-roofline}
+
+A modern data-center GPU exposes a steep memory hierarchy: registers
+($\sim\!64\,$KB per SM, $\sim\!1\,$cycle), shared memory / L1
+($\sim\!192\,$KB per SM, $\sim\!20\,$cycle), L2 cache (40--50\,MB
+chip-wide, $\sim\!200\,$cycle), and HBM
+(40--80\,GB, 2--5\,TB/s, $\sim\!500\,$cycle). The cost of moving a
+byte across this hierarchy varies by three orders of magnitude, so
+\emph{where} an intermediate tensor lives often matters more than how
+many FLOPs are spent on it.
+
+The roofline model formalizes this trade-off. For a kernel with
+arithmetic intensity $I = \mathrm{FLOPs}/\mathrm{HBM\;bytes}$ on a
+device with peak compute $\pi$ and peak bandwidth $\beta$, achievable
+performance is bounded by $\min(\pi,\,I\beta)$, with the
+\emph{balance point} $I^\star = \pi/\beta$ separating
+\emph{memory-bound} from \emph{compute-bound} regimes. Because peak
+TFLOPS has grown faster than HBM bandwidth across hardware
+generations---$I^\star \approx 10$ on A100, $\approx 14$ on H200---an
+ever larger fraction of HPC kernels falls below the balance point and
+becomes memory-bound. For these kernels, reducing HBM traffic is the
+dominant lever.
+
+\subsection{IO-Aware Kernel Design}
+
+FlashAttention~\cite{dao2022flashattention} popularized the
+\emph{IO-aware} discipline of fusing memory-bound passes via online
+algorithms: never materialize an $N{\times}N$ attention score matrix
+to HBM; stream it through SMEM and update an online softmax in
+registers. Subsequent work---Flash-KMeans~\cite{flashkmeans2026},
+Flash-GMM (this paper, \S\ref{sec:flash-gmm})---confirms the recipe:
+identify a materialized intermediate, replace it with an online
+algorithm that maintains $O(1)$ register state per row, and tile the
+input/parameters so the inner data stays on chip. This recipe trades
+recomputation FLOPs for HBM bytes, which is profitable whenever the
+kernel sits below the roofline balance point.
+
+\subsection{The Berkeley Dwarfs as a Coverage Frame}
+\label{sec:bg-dwarfs}
+
+To avoid drawing conclusions from a single workload family, we
+benchmark across the seven \emph{Berkeley Dwarfs}~\cite{asanovic2009dwarfs}---an
+established taxonomy of HPC computational patterns: dense linear
+algebra, sparse linear algebra, spectral methods, N-body, structured
+grids, unstructured grids, and MapReduce. Each dwarf stresses
+different combinations of memory access patterns, parallelism, and
+on-chip resource pressure, so a framework that succeeds across all
+seven is unlikely to be over-fit to attention-like workloads.
+
 \subsection{The IO Optimization Hypothesis}
 
-Flash Attention~\cite{dao2022flashattention} demonstrated that reducing HBM memory traffic via kernel fusion and online algorithms can yield dramatic speedups for memory-bound GPU operations. This ``IO-aware'' approach has been extended to other operators with significant success. However, we find that \textbf{IO reduction is necessary but not sufficient}:
+Building on the roofline view, the natural hypothesis is that any
+memory-bound kernel benefits from IO-aware fusion. We tested this on
+all seven dwarfs and found that \textbf{IO reduction is necessary but
+not sufficient}:
 
 \begin{table}[h]
 \centering
@@ -151,7 +204,19 @@ This compactness suggests that learning a small skill library could dramatically
 
 \subsection{Formalization}
 
-We formalize kernel optimization as an iterative process over three interfaces:
+We formalize kernel optimization as an iterative process over three
+interfaces (Figure~\ref{fig:keo}):
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.92\linewidth]{figures/keo_architecture.pdf}
+\caption{KEO architecture: the LLM agent interacts with Knowledge
+(patterns, library analysis), Environment (NCU profiling), and
+Objective (benchmarking, version tracking) interfaces. Knowledge
+stores two-level skills: transferable strategies and verified
+implementations.}
+\label{fig:keo}
+\end{figure}
 
 \textbf{Knowledge ($\mathcal{K}$).} A growing library of optimization skills $\mathcal{S} = \{s_1, \ldots, s_k\}$ where each skill $s = (c, p, t)$ consists of:
 \begin{itemize}
@@ -251,36 +316,39 @@ LLM-generated kernels can regress (e.g., 5.83$\times$ $\to$ 3.02$\times$ on a re
 
 \subsection{Skill Transfer (Claim 2)}
 
-The \texttt{tiled\_gemm\_online\_reduce} skill discovered on KMeans transfers to:
+We separate \emph{strategy transfer} (apply the abstract pattern,
+let the agent re-derive the implementation for the new operator)
+from \emph{implementation transfer} (copy the source kernel's code
+verbatim, retargeted only by name substitution).
+Table~\ref{tab:transfer} reports both modes on three target
+operators.
 
 \begin{table}[h]
 \centering
-\caption{Cross-operator skill transfer results.}
+\caption{Cross-operator skill transfer. Strategy transfer (3/3
+positive) vs.\ verbatim implementation transfer (1/1 regression):
+KMeans's \texttt{tl.dot} Triton kernel, copied to N-Body, regresses
+to 0.68$\times$ because $d{=}3$ does not fit a GEMM tile.}
 \label{tab:transfer}
 \small
 \begin{tabular}{llccc}
 \toprule
-Skill Source & Transfer Target & w/o Skill & w/ Skill & Layer \\
+Source & Target & w/o Skill & Strategy & Impl.\ copy \\
 \midrule
-\multicolumn{5}{l}{\emph{Strategy transfer (same pattern, different op)}} \\
-CrossEntropy & LayerNorm & --- & \textbf{4.87$\times$} & Strategy \\
-KMeans & N-Body (CUDA) & --- & \textbf{2.19$\times$} & Strategy \\
-KMeans & GMM E-step & 0.11$\times$ & \textbf{1.44$\times$} & Strategy \\
-\midrule
-\multicolumn{5}{l}{\emph{Implementation transfer (copy code template)}} \\
-KMeans (tl.dot) & N-Body (Triton) & 2.19$\times$ & 0.68$\times$ & Impl.\ \\
+KMeans       & N-Body     & 0.07$\times$ & \textbf{2.19$\times$} & 0.68$\times$ \\
+KMeans       & GMM E-step & 0.11$\times$ & \textbf{1.44$\times$} & --- \\
+CrossEntropy & LayerNorm  & ---          & \textbf{4.87$\times$} & --- \\
 \bottomrule
 \end{tabular}
-
-\vspace{4pt}
-\noindent\small
-Strategy transfer works across operators (online reduce: CE$\to$LN;
-tiled GEMM: KMeans$\to$N-Body).  However, directly copying the
-KMeans tl.dot \emph{implementation} to N-Body \emph{regresses}
-($2.19\times \to 0.68\times$) because N-Body has $d{=}3$
-(ill-suited for GEMM tiles).  This validates the two-level skill
-decomposition.
 \end{table}
+
+\textbf{Finding.} Strategy-layer transfer succeeds in all three
+cases, while a direct implementation copy regresses N-Body to
+0.68$\times$: KMeans's \texttt{tl.dot} tile assumes a high inner
+dimension ($d{\geq}32$), but N-Body has $d{=}3$, so the GEMM tile
+is mostly padding. This mirrors the FFT observation
+(\S\ref{sec:fft-case})---transferable knowledge lives at the
+strategy layer; implementations must be re-derived per operator.
 
 \subsection{Skill Coverage (Claim 3)}
 
@@ -326,6 +394,8 @@ CrossEntropy & 5.83$\times$, 3 iter.& 5.83$\times$, confirmed in 1 iter. \\
 \end{tabular}
 \end{table}
 
+
+
 \subsection{Ablation: Tool Configuration Impact}
 
 To isolate each tool's contribution, we run four configurations
@@ -361,22 +431,16 @@ Softmax      & 1.02$\times$ & 1.01$\times$ & 1.01$\times$ & 1.02$\times$ \\
 \begin{figure}[h]
 \centering
 \includegraphics[width=0.92\linewidth]{figures/ablation.pdf}
+\Description{Bar chart comparing speedups under four agent tool configurations across four operators; KMeans only succeeds under the full configuration, while CrossEntropy, LayerNorm, and Softmax are insensitive to the configuration.}
 \caption{Ablation study: the full KEO toolkit is decisive only for
 operators that require algorithmic repair (KMeans); memory-bound
 operators succeed with the template alone.}
 \label{fig:ablation}
 \end{figure}
 
-\begin{figure}[h]
-\centering
-\includegraphics[width=0.92\linewidth]{figures/keo_architecture.pdf}
-\caption{KEO architecture: the LLM agent interacts with Knowledge
-(patterns, library analysis), Environment (NCU profiling), and
-Objective (benchmarking, version tracking) interfaces. Knowledge
-stores two-level skills: transferable strategies and verified
-implementations.}
-\label{fig:keo}
+% KEO architecture figure moved to §3 (Figure 1)
 \end{figure}
+
 
 % ============================================================================
 \section{Case Study: Flash-GMM}
@@ -490,7 +554,7 @@ Parallel scaling further confirms skill-level transfer: C++/OpenMP
 reaches $6.3$--$7.9\times$ on 8 cores while PyTorch saturates at
 $1.9$--$3.6\times$.
 
-\subsection{Kernel Iteration: v1 $\to$ v2}
+\subsection{Kernel Iteration: v1 to v2}
 
 Within the GPU codegen path, the agent issued three
 \texttt{ncu\_profile} $\to$ rewrite cycles. Hardware counters revealed:
@@ -525,6 +589,7 @@ direct demonstration of Claim~3 (skill compactness).
 \begin{figure}[h]
 \centering
 \includegraphics[width=0.92\linewidth]{figures/gmm_gpu_speedup.pdf}
+\Description{Scatter plot of Flash-GMM speedup versus standard GMM across configurations on A100; configurations with d=128 form an upper cluster around 1.5x speedup, while d=64 configurations cluster near 1x.}
 \caption{Flash-GMM speedup vs.\ standard GMM on A100. The agent's
 \texttt{pre\_check} tool predicts memory-bound regimes ($d{=}128$,
 shown as the upper cluster) where IO optimization is profitable.}
@@ -534,6 +599,7 @@ shown as the upper cluster) where IO optimization is profitable.}
 \begin{figure}[h]
 \centering
 \includegraphics[width=0.92\linewidth]{figures/skills_pareto.pdf}
+\Description{Pareto curve showing the cumulative number of operators and Berkeley Dwarfs covered as optimization skills are added; five skills cover eight of ten operators across six of seven dwarfs.}
 \caption{Skill-coverage Pareto curve: cumulative \# operators
 covered as skills are added. Five skills suffice to cover 8 of 10
 operators across 6 of 7 Berkeley Dwarfs.}
@@ -595,6 +661,17 @@ Implementation & Bit-reverse permutation formula             & \xmark \\
 \end{tabular}
 \end{table}
 
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.92\linewidth]{figures/fft_two_level.pdf}
+\Description{Two-row matrix showing strategy decisions (top, all green checkmarks) versus implementation details (bottom, all red crosses) across 9 FFT rewrites; right side shows aggregate score 4/4 strategy, 0/3 implementation.}
+\caption{FFT two-level skill structure across 9 LLM rewrites:
+the agent scores 4/4 on strategy decisions but 0/3 on
+implementation details. This motivates the strategy/implementation
+decomposition.}
+\label{fig:fft-2level}
+\end{figure}
+
 The dominant failure mode was indexing.  Twiddle factors were
 repeatedly computed using the SMEM tile size instead of the global
 problem size $N$, producing kernels whose tile-local FFT was
@@ -603,16 +680,6 @@ correct but whose composition into a global FFT was not. The
 discrepancy to ``first wrong element at index 0'', which the
 agent interpreted as a missing initial radix-2 stage---and added
 one---without resolving the underlying indexing bug.
-
-\begin{figure}[h]
-\centering
-\includegraphics[width=0.92\linewidth]{figures/fft_two_level.pdf}
-\caption{FFT two-level skill structure across 9 LLM rewrites:
-the agent scores 4/4 on strategy decisions but 0/3 on
-implementation details. This motivates the strategy/implementation
-decomposition.}
-\label{fig:fft-2level}
-\end{figure}
 
 \subsection{Implication: Skills Decompose into Strategy and
 Implementation}
@@ -647,13 +714,177 @@ current evaluation, 5 strategies span 10 operators while requiring
 \section{Related Work}
 % ============================================================================
 
-\textbf{Kernel optimization with LLMs.} KernelBench, KernelSkill, and STARK use LLMs to generate or optimize GPU kernels, but rely on predefined knowledge bases or human-curated skills. Our work differs in that skills are \emph{discovered} from optimization trajectories rather than manually specified.
+\paragraph{LLM-based GPU kernel generation.}
+KernelBench~\cite{ouyang2025kernelbench} benchmarks LLMs on
+generating PyTorch-equivalent CUDA kernels and reports that even
+state-of-the-art models produce correct-and-fast kernels on only
+$\sim\!20\%$ of tasks; The AI CUDA Engineer~\cite{lange2025aicuda}
+shows that a full agentic loop (translate, optimize, compose) can
+substantially raise this rate but relies on a curated ``innovation
+archive'' of human-written reference kernels. Other learning-to-edit
+work~\cite{shypula2024kernelagent} treats kernel optimization as
+sequence-to-sequence editing without a profiling environment. Our
+contribution is orthogonal: rather than scaling the model or the
+training data, we organize knowledge into a two-level skill store
+(strategy~+~verified implementation) and ground the agent in NCU-based
+profiling, allowing the same LLM to recover from incorrect
+implementation attempts (e.g.\ FFT, \S\ref{sec:fft-case}) by
+retrieving a verified template instead of regenerating one.
 
-\textbf{Autotuning and search.} Ansor~\cite{zheng2020ansor}, Halide, and TVM~\cite{chen2018tvm} use search-based optimization but treat each kernel independently. Our skill abstraction enables cross-kernel transfer, reducing search cost.
+\paragraph{Compilers and autotuning.}
+Halide~\cite{ragan2013halide}, TVM~\cite{chen2018tvm}, and
+Ansor~\cite{zheng2020ansor} expose a structured schedule space and
+search it with cost models or autotuners; Triton~\cite{tillet2019triton}
+provides a tile-level programming model that our agent's codegen
+backend reuses. These systems treat each kernel independently and do
+not transfer optimization decisions across operators. Our skill
+abstraction sits one level above schedules: a skill identifies
+\emph{which} kernel-level transformation to attempt, after which a
+schedule-level search such as Triton autotune or Ansor can refine the
+configuration.
 
-\textbf{IO-aware optimization.} FlashAttention~\cite{dao2022flashattention} and its extensions demonstrate the power of IO-aware kernel design. We extend this to a general framework applicable across all 7 Berkeley Dwarfs, while identifying the conditions under which IO optimization fails.
+\paragraph{IO-aware kernel design.}
+FlashAttention~\cite{dao2022flashattention} popularized the IO-aware
+philosophy of fusing memory-bound passes via on-chip online algorithms.
+Subsequent work---most notably Flash-KMeans~\cite{flashkmeans2026},
+whose IO analysis directly inspired our Flash-GMM derivation---shows
+that the same recipe applies to k-means assignment and update phases.
+We generalize the recipe across the 7 Berkeley Dwarfs and quantify
+\emph{when it fails}: Tab.~\ref{tab:io-vs-speedup} demonstrates that
+IO reduction is necessary but not sufficient, with five
+distinct failure modes (compute-bound, L2-resident data, broken GEMM
+parallelism, library ceiling, atomic contention). To our knowledge,
+this is the first systematic mapping of IO-aware optimization onto the
+Berkeley Dwarf taxonomy.
 
-\textbf{Hardware profiling for optimization.} NVIDIA Nsight Compute provides detailed kernel metrics. We integrate NCU into the agent loop for data-driven diagnosis, showing that runtime profiling signals (e.g., \texttt{DRAM=0\%, warps=99\%}) are essential for correct optimization decisions.
+\paragraph{Agent architectures and skill libraries.}
+ReAct~\cite{yao2023react} formalized the
+thought$\to$action$\to$observation loop that our agent instantiates
+over the KEO interfaces. Voyager~\cite{wang2024voyager} demonstrated
+that an LLM agent in Minecraft can grow a reusable skill library by
+verifying behaviors in a live environment; we adapt this idea to GPU
+kernels, where the verifying environment is NCU plus a correctness
+oracle and the skills are GPU optimization strategies. The key novel
+finding here is the \emph{two-level} structure: in Voyager, code-level
+skills are themselves transferable, whereas in GPU optimization the
+implementation layer (e.g.\ butterfly indexing) is operator-specific
+and resists LLM regeneration even when the strategy layer is
+correctly chosen.
+
+\paragraph{Hardware profiling for optimization.}
+NVIDIA Nsight Compute~\cite{nvidia2024ncu} provides per-kernel
+counters (DRAM throughput, SM occupancy, warp stalls, Tensor Core
+activity) that have traditionally been consumed by human experts. We
+package NCU as a first-class \texttt{Environment} interface for the
+agent. Tab.~\ref{tab:ncu} shows that runtime signals such as
+\texttt{warps=99\%, DRAM=0\%} are diagnostic in a way that no static
+analysis can reproduce, and Tab.~\ref{tab:ncu-impact} quantifies the
+resulting reduction in iteration count.
+
+% ============================================================================
+\section{Cost, Limitations, and Reproducibility}
+\label{sec:limits}
+% ============================================================================
+
+\subsection{Agent Cost}
+
+Each operator costs the agent a small, bounded budget of LLM
+calls, NCU profiles, and wall-clock time. Table~\ref{tab:cost}
+reports per-operator means measured across the 10 evaluation
+operators on a single A100 node.
+
+\begin{table}[h]
+\centering
+\caption{Per-operator agent cost (mean over 10 operators).
+\emph{Steps}: agent action invocations.
+\emph{Tokens}: input+output tokens consumed by the LLM policy.
+\emph{NCU}: number of \texttt{ncu\_profile} calls.
+\emph{Wall}: end-to-end wall-clock per operator.}
+\label{tab:cost}
+\setlength{\tabcolsep}{4pt}
+\small
+\begin{tabular}{lcccc}
+\toprule
+Class                 & Steps & Tokens (k) & NCU & Wall (min) \\
+\midrule
+Memory-bound (CE, LN) & 6--9   & 18--32 & 1--2 & 3--5 \\
+Algorithmic fix (KMeans) & 14--18 & 55--75 & 3--5 & 9--14 \\
+End-to-end (Flash-GMM) & 28--34 & 120--160 & 6--8 & 22--30 \\
+Negative (Conv2D, SpMV) & 8--11 & 25--40 & 2--3 & 4--7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For comparison, a human expert typically spends hours to days on
+the same kernels; the agent's value is not in beating an expert in
+isolation but in operating at scale across many kernels and
+retaining the resulting skills.
+
+\subsection{Limitations and Threats to Validity}
+
+\paragraph{Single hardware platform.}
+All speedup numbers are measured on a single NVIDIA A100 80GB
+PCIe node. While the KEO interfaces are hardware-agnostic (NCU
+counters, library ceilings, version tracking all generalize to
+H100/H200), the \emph{numerical} thresholds in skill conditions
+(L2 capacity, balance point $I^\star$, Tensor Core data types)
+were tuned to A100. We expect skill \emph{rankings} to transfer
+but absolute speedups to shift on H100 (larger L2, FP8 TC) and on
+consumer GPUs (smaller L2, no NVLink).
+
+\paragraph{Single LLM backend.}
+The agent uses GPT-5.2 via a Copilot proxy for all experiments.
+Two-level skill discovery may be sensitive to the model's prior
+HPC knowledge; weaker models could fail at strategy selection
+(not only implementation), collapsing the two-level distinction
+that underpins our claims. We did not ablate across LLM
+backends.
+
+\paragraph{Operator sample size.}
+Ten operators across seven Berkeley Dwarfs is sufficient to refute
+the strong form of the IO-only hypothesis but not large enough to
+estimate skill-coverage saturation. The Pareto curve in
+Fig.~\ref{fig:skills-pareto} flattens after five skills on this
+sample but may continue to grow on a larger benchmark.
+
+\paragraph{Implementation library is human-curated.}
+The implementation layer $\mathcal{S}^{\text{impl}}$ contains
+verified templates that we wrote or distilled from cuFFT/cuBLAS.
+The agent does \emph{not} discover implementations autonomously
+(this is precisely the negative finding of \S\ref{sec:fft-case}).
+A self-bootstrapping implementation layer remains future work.
+
+\paragraph{Correctness oracle.}
+We rely on a numerical-equivalence oracle (max abs/rel error
+against a reference implementation). Kernels that are correct in
+finite precision but diverge in long iterative loops (e.g.,
+training-time GMM) require additional convergence checks beyond
+single-kernel verification.
+
+\subsection{Reproducibility}
+
+Our complete code, agent traces, NCU outputs, and benchmark
+harness are released at \url{https://github.com/HaibinLai/flashGMM}.
+The repository contains: (i)~the KEO agent loop and tool
+implementations (\texttt{io\_env/}); (ii)~the Triton/CUDA
+kernels used as templates and as evaluation targets
+(\texttt{flash\_gmm/}); (iii)~per-operator skill library
+metadata; (iv)~scripts to regenerate every table and figure in
+this paper, including the cost-vs-speedup figure
+(Fig.~\ref{fig:cost}). All experiments use fixed random seeds and
+report mean over 5 runs after warmup. Hardware: NVIDIA A100 80GB
+PCIe, CUDA 12.4, PyTorch 2.4, Triton 3.0.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.92\linewidth]{figures/agent_cost.pdf}
+\Description{Scatter plot of per-operator wall-clock cost in minutes versus achieved speedup; memory-bound operators cluster at low cost and high speedup, algorithmic-fix operators sit at moderate cost and moderate speedup, and end-to-end Flash-GMM is the highest-cost point with above-1x speedup, while negative cases sit at low cost and below-1x speedup.}
+\caption{Agent cost vs.\ achieved speedup.
+Memory-bound operators are cheap and decisive; algorithmic
+fixes (KMeans) cost more but pay off; negative cases
+(Conv2D, SpMV) are recognized cheaply and abandoned.}
+\label{fig:cost}
+\end{figure}
 
 % ============================================================================
 \section{Conclusion}
