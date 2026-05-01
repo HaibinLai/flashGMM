@@ -785,6 +785,36 @@ def _make_inputs(task: str, params: dict):
         H, W = params.get("H", 4096), params.get("W", 4096)
         T = params.get("T", 100)
         return (torch.randn(H, W, device="cuda"), T)
+    elif task == "spmv":
+        M = params.get("M", 100000)
+        N_sp = params.get("N", 100000)
+        NNZ = params.get("NNZ", 1000000)
+        nnz_per_row = NNZ // M
+        row_ptr = torch.zeros(M + 1, dtype=torch.int32, device="cuda")
+        for i in range(M):
+            row_ptr[i + 1] = row_ptr[i] + nnz_per_row
+        row_ptr[-1] = NNZ
+        col_idx = torch.randint(0, N_sp, (NNZ,), dtype=torch.int32, device="cuda")
+        values = torch.randn(NNZ, device="cuda")
+        x = torch.randn(N_sp, device="cuda")
+        return (values, col_idx, row_ptr, x)
+    elif task == "nbody":
+        N_body = params.get("N", 16384)
+        d = params.get("d", 3)
+        return (torch.randn(N_body, d, device="cuda"), torch.ones(N_body, device="cuda"))
+    elif task == "graph_laplacian":
+        M = params.get("M", 100000)
+        NNZ = params.get("NNZ", 1000000)
+        nnz_per_row = NNZ // M
+        row_ptr = torch.zeros(M + 1, dtype=torch.int32, device="cuda")
+        for i in range(M):
+            row_ptr[i + 1] = row_ptr[i] + nnz_per_row
+        row_ptr[-1] = NNZ
+        col_idx = torch.randint(0, M, (NNZ,), dtype=torch.int32, device="cuda")
+        values = torch.randn(NNZ, device="cuda")
+        degree = torch.full((M,), float(nnz_per_row), device="cuda")
+        x = torch.randn(M, device="cuda")
+        return (values, col_idx, row_ptr, degree, x)
     return None
 
 

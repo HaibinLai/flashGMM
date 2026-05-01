@@ -794,3 +794,246 @@ EXAMPLES.update({
         "default_params": {"H": 4096, "W": 4096, "T": 100, "BH": 64, "BW": 64, "S": 8},
     },
 })
+
+
+# ============================================================================
+# Dwarf 2: Sparse Linear Algebra — SpMV (CSR format)
+# ============================================================================
+
+def spmv_baseline() -> ComputationGraph:
+    """
+    Standard SpMV: y = A·x where A is sparse (CSR).
+    Baseline scatters across rows naively — each row reads random x entries.
+    IO: read all of CSR (vals, col_idx, row_ptr) + read x (with random gather) + write y.
+    For large x that doesn't fit L2, each row's gather causes cache misses.
+    """
+    return ComputationGraph(
+        name="spmv_standard",
+        description="SpMV CSR baseline: per-row scalar dot product with random x gather",
+        inputs={
+            "values":  TensorSpec(shape=("NNZ",), dtype="f32"),
+            "col_idx": TensorSpec(shape=("NNZ",), dtype="i32"),
+            "row_ptr": TensorSpec(shape=("M_plus_1",), dtype="i32"),
+            "x":       TensorSpec(shape=("N",), dtype="f32"),
+        },
+        operations=[
+            Op(name="spmv_rows",
+               reads=["values", "col_idx", "row_ptr", "x"],
+               computes="sparse_dot",
+               flops_fn=lambda p: 2 * p["NNZ"],
+               output=TensorSpec(shape=("M",), dtype="f32", storage="HBM"),
+               output_name="y",
+               notes="Each row gathers random x[col_idx[j]] entries — poor spatial locality. "
+                     "If x >> L2, every gather is an HBM cache miss."),
+        ],
+        outputs=["y"],
+    )
+
+
+def spmv_flash() -> ComputationGraph:
+    """
+    Flash SpMV: cache x vector tiles in SMEM, process row groups that share x tiles.
+    For banded/structured sparsity: partition columns into tiles of size BN,
+    load x[BN] into SMEM, process all rows that touch this tile.
+    Reduces random x gathers from NNZ to ceil(N/BN) × BN.
+    """
+    return ComputationGraph(
+        name="spmv_flash",
+        description="Flash SpMV: tile x in SMEM, reduce random gathers",
+        inputs={
+            "values":  TensorSpec(shape=("NNZ",), dtype="f32"),
+            "col_idx": TensorSpec(shape=("NNZ",), dtype="i32"),
+            "row_ptr": TensorSpec(shape=("M_plus_1",), dtype="i32"),
+            "x":       TensorSpec(shape=("N",), dtype="f32"),
+        },
+        operations=[
+            FusedOp(
+                name="flash_spmv",
+                reads=["values", "col_idx", "row_ptr", "x"],
+                computes="sparse_dot[cached_x_tiles]",
+                flops_fn=lambda p: 2 * p["NNZ"],
+                output=TensorSpec(shape=("M",), dtype="f32", storage="HBM"),
+                output_name="y",
+                tiling=TilingSpec(tiles={"N": "BN", "M": "BM"}),
+                notes="Cache x tiles in SMEM. For banded matrices, reduces x gathers from "
+                      "NNZ random reads to ceil(N/BN) sequential tile loads.",
+            ),
+        ],
+        outputs=["y"],
+    )
+
+
+# ============================================================================
+# Dwarf 4: N-Body Methods — Particle pairwise interaction
+# ============================================================================
+
+def nbody_baseline() -> ComputationGraph:
+    """
+    Standard N-Body: compute all pairwise forces/potentials.
+    Materializes N×N distance/force matrix to HBM, then reduces per-particle.
+    IO: write N×N matrix + read it for reduction = O(N²) HBM traffic.
+    """
+    return ComputationGraph(
+        name="nbody_standard",
+        description="N-Body: materialize N×N pairwise distance/force matrix",
+        inputs={
+            "pos": TensorSpec(shape=("N", "d"), dtype="f32"),
+            "mass": TensorSpec(shape=("N",), dtype="f32"),
+        },
+        operations=[
+            Op(name="pairwise_distance",
+               reads=["pos"],
+               computes="pairwise_l2",
+               flops_fn=lambda p: p["N"] * p["N"] * (2 * p["d"] + 1),
+               output=TensorSpec(shape=("N", "N"), dtype="f32", storage="HBM"),
+               output_name="dist_matrix",
+               notes="Materialize full N×N distance matrix to HBM"),
+
+            Op(name="compute_forces",
+               reads=["dist_matrix", "mass"],
+               computes="gravitational_force",
+               flops_fn=lambda p: p["N"] * p["N"] * 5,
+               output=TensorSpec(shape=("N", "N"), dtype="f32", storage="HBM"),
+               output_name="force_matrix",
+               notes="Materialize N×N force magnitudes"),
+
+            Op(name="reduce_forces",
+               reads=["force_matrix", "pos"],
+               computes="weighted_sum",
+               flops_fn=lambda p: p["N"] * p["N"] * p["d"],
+               output=TensorSpec(shape=("N", "d"), dtype="f32", storage="HBM"),
+               output_name="acceleration"),
+        ],
+        outputs=["acceleration"],
+    )
+
+
+def nbody_flash() -> ComputationGraph:
+    """
+    Flash N-Body: tile particles into groups of BN, compute pairwise forces
+    within SMEM, accumulate per-particle force on-chip.
+    Never materialize N×N matrix. IO: O(N × ceil(N/BN) × d) reads of pos tiles.
+    """
+    return ComputationGraph(
+        name="nbody_flash",
+        description="Flash N-Body: tiled pairwise, on-chip force accumulation",
+        inputs={
+            "pos": TensorSpec(shape=("N", "d"), dtype="f32"),
+            "mass": TensorSpec(shape=("N",), dtype="f32"),
+        },
+        operations=[
+            FusedOp(
+                name="flash_nbody",
+                reads=["pos", "mass"],
+                computes="pairwise_l2+force+reduce[tiled_accumulate]",
+                flops_fn=lambda p: p["N"] * p["N"] * (2 * p["d"] + 6 + p["d"]),
+                output=TensorSpec(shape=("N", "d"), dtype="f32", storage="HBM"),
+                output_name="acceleration",
+                tiling=TilingSpec(tiles={"N": "BN"}),
+                notes="Tile N into BN groups. For each target block, stream all source blocks "
+                      "through SMEM, accumulate force in registers. N×N never in HBM.",
+            ),
+        ],
+        outputs=["acceleration"],
+    )
+
+
+# ============================================================================
+# Dwarf 6: Unstructured Grids — Graph Laplacian (scatter-gather)
+# ============================================================================
+
+def graph_laplacian_baseline() -> ComputationGraph:
+    """
+    Standard graph Laplacian apply: y = L·x = D·x - A·x
+    where A is adjacency (CSR), D is degree diagonal.
+    Baseline: compute A·x (SpMV) + D·x separately, materialize both.
+    """
+    return ComputationGraph(
+        name="graph_laplacian_standard",
+        description="Graph Laplacian: separate SpMV(A,x) and D*x, materialize both",
+        inputs={
+            "values":  TensorSpec(shape=("NNZ",), dtype="f32"),
+            "col_idx": TensorSpec(shape=("NNZ",), dtype="i32"),
+            "row_ptr": TensorSpec(shape=("M_plus_1",), dtype="i32"),
+            "degree":  TensorSpec(shape=("M",), dtype="f32"),
+            "x":       TensorSpec(shape=("M",), dtype="f32"),
+        },
+        operations=[
+            Op(name="spmv_Ax",
+               reads=["values", "col_idx", "row_ptr", "x"],
+               computes="sparse_dot",
+               flops_fn=lambda p: 2 * p["NNZ"],
+               output=TensorSpec(shape=("M",), dtype="f32", storage="HBM"),
+               output_name="Ax",
+               notes="Materialize A·x to HBM"),
+
+            Op(name="diag_Dx",
+               reads=["degree", "x"],
+               computes="elementwise_mul",
+               flops_fn=lambda p: p["M"],
+               output=TensorSpec(shape=("M",), dtype="f32", storage="HBM"),
+               output_name="Dx",
+               notes="Materialize D·x to HBM"),
+
+            Op(name="subtract",
+               reads=["Dx", "Ax"],
+               computes="elementwise_sub",
+               flops_fn=lambda p: p["M"],
+               output=TensorSpec(shape=("M",), dtype="f32", storage="HBM"),
+               output_name="Lx"),
+        ],
+        outputs=["Lx"],
+    )
+
+
+def graph_laplacian_flash() -> ComputationGraph:
+    """
+    Flash graph Laplacian: fuse SpMV + diagonal multiply + subtract into one kernel.
+    Per row: y[i] = degree[i]*x[i] - sum_j(A[i,j]*x[j])
+    One pass over CSR, no intermediate materialization.
+    """
+    return ComputationGraph(
+        name="graph_laplacian_flash",
+        description="Flash Laplacian: fused SpMV + diag + sub, zero intermediates",
+        inputs={
+            "values":  TensorSpec(shape=("NNZ",), dtype="f32"),
+            "col_idx": TensorSpec(shape=("NNZ",), dtype="i32"),
+            "row_ptr": TensorSpec(shape=("M_plus_1",), dtype="i32"),
+            "degree":  TensorSpec(shape=("M",), dtype="f32"),
+            "x":       TensorSpec(shape=("M",), dtype="f32"),
+        },
+        operations=[
+            FusedOp(
+                name="flash_laplacian",
+                reads=["values", "col_idx", "row_ptr", "degree", "x"],
+                computes="sparse_dot+diag_mul+sub[fused_row]",
+                flops_fn=lambda p: 2 * p["NNZ"] + 2 * p["M"],
+                output=TensorSpec(shape=("M",), dtype="f32", storage="HBM"),
+                output_name="Lx",
+                tiling=TilingSpec(tiles={"M": "BM"}),
+                notes="One pass over CSR: accumulate A·x per row in registers, "
+                      "then y[i] = deg[i]*x[i] - acc. No Ax or Dx materialized.",
+            ),
+        ],
+        outputs=["Lx"],
+    )
+
+
+# Update registry with Berkeley Dwarfs
+EXAMPLES.update({
+    "spmv": {
+        "baseline": spmv_baseline,
+        "flash": spmv_flash,
+        "default_params": {"M": 100000, "N": 100000, "NNZ": 1000000, "M_plus_1": 100001, "BN": 256, "BM": 64},
+    },
+    "nbody": {
+        "baseline": nbody_baseline,
+        "flash": nbody_flash,
+        "default_params": {"N": 16384, "d": 3, "BN": 256},
+    },
+    "graph_laplacian": {
+        "baseline": graph_laplacian_baseline,
+        "flash": graph_laplacian_flash,
+        "default_params": {"M": 100000, "N": 100000, "NNZ": 1000000, "M_plus_1": 100001, "BM": 64},
+    },
+})

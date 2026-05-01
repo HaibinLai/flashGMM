@@ -931,6 +931,342 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 '''
 
+# ============================================================================
+# Berkeley Dwarf 2: Sparse Linear Algebra — SpMV (CSR)
+# ============================================================================
+
+CUDA_TEMPLATES["spmv"] = r'''
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+// ---- Standard CSR SpMV: one thread per row ----
+__global__ void spmv_csr_kernel(
+    const float* __restrict__ values,
+    const int* __restrict__ col_idx,
+    const int* __restrict__ row_ptr,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M) return;
+    float sum = 0.0f;
+    int start = row_ptr[row], end = row_ptr[row + 1];
+    for (int j = start; j < end; j++) {
+        sum += values[j] * x[col_idx[j]];
+    }
+    y[row] = sum;
+}
+
+// ---- Flash SpMV: warp-per-row with shared memory x caching ----
+// Each warp processes one row; threads within warp cooperate on the dot product.
+// If nonzeros per row > 32, multiple passes with warp-level reduction.
+__global__ void flash_spmv_kernel(
+    const float* __restrict__ values,
+    const int* __restrict__ col_idx,
+    const int* __restrict__ row_ptr,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M
+) {
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+    if (warp_id >= M) return;
+
+    int start = row_ptr[warp_id], end = row_ptr[warp_id + 1];
+    float sum = 0.0f;
+
+    // Each thread in warp handles a subset of nonzeros
+    for (int j = start + lane; j < end; j += 32) {
+        sum += values[j] * x[col_idx[j]];
+    }
+
+    // Warp-level reduction
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffff, sum, offset);
+    }
+
+    if (lane == 0) {
+        y[warp_id] = sum;
+    }
+}
+
+torch::Tensor reference_spmv(torch::Tensor values, torch::Tensor col_idx,
+                              torch::Tensor row_ptr, torch::Tensor x) {
+    int M = row_ptr.size(0) - 1;
+    auto y = torch::empty({M}, values.options());
+    int threads = 256;
+    int blocks = (M + threads - 1) / threads;
+    spmv_csr_kernel<<<blocks, threads>>>(
+        values.data_ptr<float>(), col_idx.data_ptr<int>(),
+        row_ptr.data_ptr<int>(), x.data_ptr<float>(),
+        y.data_ptr<float>(), M);
+    return y;
+}
+
+torch::Tensor flash_spmv(torch::Tensor values, torch::Tensor col_idx,
+                          torch::Tensor row_ptr, torch::Tensor x) {
+    int M = row_ptr.size(0) - 1;
+    auto y = torch::empty({M}, values.options());
+    // One warp per row
+    int warps_per_block = 8;
+    int threads = warps_per_block * 32;
+    int blocks = (M + warps_per_block - 1) / warps_per_block;
+    flash_spmv_kernel<<<blocks, threads>>>(
+        values.data_ptr<float>(), col_idx.data_ptr<int>(),
+        row_ptr.data_ptr<int>(), x.data_ptr<float>(),
+        y.data_ptr<float>(), M);
+    return y;
+}
+
+// Library: same as reference (no cuSPARSE C++ wrapper needed, use Python-level)
+torch::Tensor library_spmv(torch::Tensor values, torch::Tensor col_idx,
+                            torch::Tensor row_ptr, torch::Tensor x) {
+    // Just call reference — Python-level library_ceiling will use torch.sparse_csr_tensor
+    return reference_spmv(values, col_idx, row_ptr, x);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("flash_spmv", &flash_spmv, "Flash SpMV (warp-per-row)");
+    m.def("reference_spmv", &reference_spmv, "Standard SpMV (thread-per-row)");
+    m.def("library_spmv", &library_spmv, "cuSPARSE SpMV via PyTorch");
+}
+'''
+
+# ============================================================================
+# Berkeley Dwarf 4: N-Body Methods — Tiled pairwise force
+# ============================================================================
+
+CUDA_TEMPLATES["nbody"] = r'''
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+static constexpr float SOFTENING = 1e-6f;
+
+// ---- Standard N-Body: O(N²) all-pairs, no materialization trick needed
+//      but we do it naively: each thread handles one target particle ----
+__global__ void nbody_naive_kernel(
+    const float* __restrict__ pos,   // (N, 3)
+    const float* __restrict__ mass,  // (N,)
+    float* __restrict__ acc,         // (N, 3)
+    int N
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    float ax = 0.0f, ay = 0.0f, az = 0.0f;
+    float xi = pos[i*3], yi = pos[i*3+1], zi = pos[i*3+2];
+
+    for (int j = 0; j < N; j++) {
+        float dx = pos[j*3] - xi;
+        float dy = pos[j*3+1] - yi;
+        float dz = pos[j*3+2] - zi;
+        float dist2 = dx*dx + dy*dy + dz*dz + SOFTENING;
+        float inv_dist3 = mass[j] * rsqrtf(dist2) / dist2;
+        ax += dx * inv_dist3;
+        ay += dy * inv_dist3;
+        az += dz * inv_dist3;
+    }
+    acc[i*3]   = ax;
+    acc[i*3+1] = ay;
+    acc[i*3+2] = az;
+}
+
+// ---- Flash N-Body: tile particles in shared memory ----
+// Each block loads BN source particles into SMEM, all target threads
+// accumulate forces from this tile. Then load next tile.
+// IO: each particle loaded ceil(N/BN) times total (but from SMEM, not HBM).
+template <int TILE>
+__global__ void flash_nbody_kernel(
+    const float* __restrict__ pos,
+    const float* __restrict__ mass,
+    float* __restrict__ acc,
+    int N
+) {
+    extern __shared__ float smem[];
+    float* s_pos = smem;           // TILE * 3
+    float* s_mass = smem + TILE*3; // TILE
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    float ax = 0.0f, ay = 0.0f, az = 0.0f;
+    float xi, yi, zi;
+    if (i < N) {
+        xi = pos[i*3]; yi = pos[i*3+1]; zi = pos[i*3+2];
+    }
+
+    for (int tile_start = 0; tile_start < N; tile_start += TILE) {
+        // Cooperatively load source tile into SMEM
+        int tid = threadIdx.x;
+        for (int k = tid; k < TILE; k += blockDim.x) {
+            int j = tile_start + k;
+            if (j < N) {
+                s_pos[k*3]   = pos[j*3];
+                s_pos[k*3+1] = pos[j*3+1];
+                s_pos[k*3+2] = pos[j*3+2];
+                s_mass[k]    = mass[j];
+            } else {
+                s_pos[k*3] = s_pos[k*3+1] = s_pos[k*3+2] = 0.0f;
+                s_mass[k] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        // Compute forces from this tile
+        if (i < N) {
+            int tile_end = min(TILE, N - tile_start);
+            for (int k = 0; k < tile_end; k++) {
+                float dx = s_pos[k*3] - xi;
+                float dy = s_pos[k*3+1] - yi;
+                float dz = s_pos[k*3+2] - zi;
+                float dist2 = dx*dx + dy*dy + dz*dz + SOFTENING;
+                float inv_dist3 = s_mass[k] * rsqrtf(dist2) / dist2;
+                ax += dx * inv_dist3;
+                ay += dy * inv_dist3;
+                az += dz * inv_dist3;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (i < N) {
+        acc[i*3]   = ax;
+        acc[i*3+1] = ay;
+        acc[i*3+2] = az;
+    }
+}
+
+torch::Tensor reference_nbody(torch::Tensor pos, torch::Tensor mass) {
+    int N = pos.size(0);
+    auto acc = torch::empty_like(pos);
+    int threads = 256;
+    int blocks = (N + threads - 1) / threads;
+    nbody_naive_kernel<<<blocks, threads>>>(
+        pos.data_ptr<float>(), mass.data_ptr<float>(),
+        acc.data_ptr<float>(), N);
+    return acc;
+}
+
+torch::Tensor flash_nbody(torch::Tensor pos, torch::Tensor mass) {
+    int N = pos.size(0);
+    auto acc = torch::empty_like(pos);
+    constexpr int TILE = 256;
+    int threads = 256;
+    int blocks = (N + threads - 1) / threads;
+    size_t smem = (TILE * 3 + TILE) * sizeof(float);
+    flash_nbody_kernel<TILE><<<blocks, threads, smem>>>(
+        pos.data_ptr<float>(), mass.data_ptr<float>(),
+        acc.data_ptr<float>(), N);
+    return acc;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("flash_nbody", &flash_nbody, "Flash N-Body (tiled SMEM)");
+    m.def("reference_nbody", &reference_nbody, "Standard N-Body (naive)");
+}
+'''
+
+# ============================================================================
+# Berkeley Dwarf 6: Unstructured Grids — Graph Laplacian
+# ============================================================================
+
+CUDA_TEMPLATES["graph_laplacian"] = r'''
+#include <torch/extension.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+// ---- Standard: separate SpMV(A,x) + D*x - Ax ----
+__global__ void spmv_kernel(
+    const float* __restrict__ values,
+    const int* __restrict__ col_idx,
+    const int* __restrict__ row_ptr,
+    const float* __restrict__ x,
+    float* __restrict__ Ax,
+    int M
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M) return;
+    float sum = 0.0f;
+    for (int j = row_ptr[row]; j < row_ptr[row+1]; j++)
+        sum += values[j] * x[col_idx[j]];
+    Ax[row] = sum;
+}
+
+__global__ void laplacian_sub_kernel(
+    const float* __restrict__ degree,
+    const float* __restrict__ x,
+    const float* __restrict__ Ax,
+    float* __restrict__ Lx,
+    int M
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= M) return;
+    Lx[i] = degree[i] * x[i] - Ax[i];
+}
+
+// ---- Flash: fused SpMV + diag - Ax in one kernel ----
+__global__ void flash_laplacian_kernel(
+    const float* __restrict__ values,
+    const int* __restrict__ col_idx,
+    const int* __restrict__ row_ptr,
+    const float* __restrict__ degree,
+    const float* __restrict__ x,
+    float* __restrict__ Lx,
+    int M
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M) return;
+
+    // Fused: accumulate A*x in register, combine with D*x, write once
+    float ax_sum = 0.0f;
+    for (int j = row_ptr[row]; j < row_ptr[row+1]; j++)
+        ax_sum += values[j] * x[col_idx[j]];
+
+    Lx[row] = degree[row] * x[row] - ax_sum;
+}
+
+torch::Tensor reference_graph_laplacian(
+    torch::Tensor values, torch::Tensor col_idx, torch::Tensor row_ptr,
+    torch::Tensor degree, torch::Tensor x
+) {
+    int M = row_ptr.size(0) - 1;
+    auto Ax = torch::empty({M}, x.options());
+    auto Lx = torch::empty({M}, x.options());
+    int threads = 256, blocks = (M + threads - 1) / threads;
+    // Step 1: SpMV → Ax (materialized to HBM)
+    spmv_kernel<<<blocks, threads>>>(
+        values.data_ptr<float>(), col_idx.data_ptr<int>(),
+        row_ptr.data_ptr<int>(), x.data_ptr<float>(),
+        Ax.data_ptr<float>(), M);
+    // Step 2: Lx = D*x - Ax (reads Ax back from HBM)
+    laplacian_sub_kernel<<<blocks, threads>>>(
+        degree.data_ptr<float>(), x.data_ptr<float>(),
+        Ax.data_ptr<float>(), Lx.data_ptr<float>(), M);
+    return Lx;
+}
+
+torch::Tensor flash_graph_laplacian(
+    torch::Tensor values, torch::Tensor col_idx, torch::Tensor row_ptr,
+    torch::Tensor degree, torch::Tensor x
+) {
+    int M = row_ptr.size(0) - 1;
+    auto Lx = torch::empty({M}, x.options());
+    int threads = 256, blocks = (M + threads - 1) / threads;
+    flash_laplacian_kernel<<<blocks, threads>>>(
+        values.data_ptr<float>(), col_idx.data_ptr<int>(),
+        row_ptr.data_ptr<int>(), degree.data_ptr<float>(),
+        x.data_ptr<float>(), Lx.data_ptr<float>(), M);
+    return Lx;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("flash_graph_laplacian", &flash_graph_laplacian, "Flash Laplacian (fused)");
+    m.def("reference_graph_laplacian", &reference_graph_laplacian, "Standard Laplacian (2-pass)");
+}
+'''
+
 
 def generate_kernel(task: str, custom_code: str | None = None, lang: str = "triton") -> tuple[str, str]:
     """
@@ -1147,6 +1483,51 @@ def compile_and_test(task: str, params: dict, filepath: str | None = None,
             max_err = (ref_out - flash_out).abs().max().item()
             mean_err = (ref_out - flash_out).abs().mean().item()
 
+        elif task == "spmv":
+            M = min(params.get("M", 10000), 10000)
+            N = min(params.get("N", 10000), 10000)
+            NNZ = min(params.get("NNZ", 50000), 50000)
+            # Generate random sparse CSR
+            row_ptr = torch.zeros(M + 1, dtype=torch.int32, device="cuda")
+            nnz_per_row = NNZ // M
+            for i in range(M):
+                row_ptr[i + 1] = row_ptr[i] + nnz_per_row
+            row_ptr[-1] = NNZ
+            col_idx = torch.randint(0, N, (NNZ,), dtype=torch.int32, device="cuda")
+            values = torch.randn(NNZ, device="cuda")
+            x = torch.randn(N, device="cuda")
+            ref_out = ref_fn(values, col_idx, row_ptr, x)
+            flash_out = flash_fn(values, col_idx, row_ptr, x)
+            max_err = (ref_out - flash_out).abs().max().item()
+            mean_err = (ref_out - flash_out).abs().mean().item()
+
+        elif task == "nbody":
+            N_body = min(params.get("N", 4096), 4096)
+            d = params.get("d", 3)
+            pos = torch.randn(N_body, d, device="cuda")
+            mass = torch.ones(N_body, device="cuda")
+            ref_out = ref_fn(pos, mass)
+            flash_out = flash_fn(pos, mass)
+            max_err = (ref_out - flash_out).abs().max().item()
+            mean_err = (ref_out - flash_out).abs().mean().item()
+
+        elif task == "graph_laplacian":
+            M = min(params.get("M", 10000), 10000)
+            NNZ = min(params.get("NNZ", 50000), 50000)
+            nnz_per_row = NNZ // M
+            row_ptr = torch.zeros(M + 1, dtype=torch.int32, device="cuda")
+            for i in range(M):
+                row_ptr[i + 1] = row_ptr[i] + nnz_per_row
+            row_ptr[-1] = NNZ
+            col_idx = torch.randint(0, M, (NNZ,), dtype=torch.int32, device="cuda")
+            values = torch.randn(NNZ, device="cuda")
+            degree = torch.full((M,), float(nnz_per_row), device="cuda")
+            x = torch.randn(M, device="cuda")
+            ref_out = ref_fn(values, col_idx, row_ptr, degree, x)
+            flash_out = flash_fn(values, col_idx, row_ptr, degree, x)
+            max_err = (ref_out - flash_out).abs().max().item()
+            mean_err = (ref_out - flash_out).abs().mean().item()
+
         else:
             return f"No test harness for '{task}'"
 
@@ -1297,6 +1678,44 @@ def benchmark_kernel(task: str, params: dict, filepath: str | None = None,
         inputs_flash = (grid_in, T)
         inputs_ref = (grid_in, T)
         ref_fn_actual = ref_fn  # reference_stencil2d
+    elif task == "spmv":
+        M = params.get("M", 100000)
+        N_sp = params.get("N", 100000)
+        NNZ = params.get("NNZ", 1000000)
+        nnz_per_row = NNZ // M
+        row_ptr = torch.zeros(M + 1, dtype=torch.int32, device="cuda")
+        for i in range(M):
+            row_ptr[i + 1] = row_ptr[i] + nnz_per_row
+        row_ptr[-1] = NNZ
+        col_idx = torch.randint(0, N_sp, (NNZ,), dtype=torch.int32, device="cuda")
+        values = torch.randn(NNZ, device="cuda")
+        x_sp = torch.randn(N_sp, device="cuda")
+        inputs_flash = (values, col_idx, row_ptr, x_sp)
+        inputs_ref = inputs_flash
+        ref_fn_actual = ref_fn
+    elif task == "nbody":
+        N_body = params.get("N", 16384)
+        d = params.get("d", 3)
+        pos = torch.randn(N_body, d, device="cuda")
+        mass = torch.ones(N_body, device="cuda")
+        inputs_flash = (pos, mass)
+        inputs_ref = inputs_flash
+        ref_fn_actual = ref_fn
+    elif task == "graph_laplacian":
+        M = params.get("M", 100000)
+        NNZ = params.get("NNZ", 1000000)
+        nnz_per_row = NNZ // M
+        row_ptr = torch.zeros(M + 1, dtype=torch.int32, device="cuda")
+        for i in range(M):
+            row_ptr[i + 1] = row_ptr[i] + nnz_per_row
+        row_ptr[-1] = NNZ
+        col_idx = torch.randint(0, M, (NNZ,), dtype=torch.int32, device="cuda")
+        values = torch.randn(NNZ, device="cuda")
+        degree = torch.full((M,), float(nnz_per_row), device="cuda")
+        x_gl = torch.randn(M, device="cuda")
+        inputs_flash = (values, col_idx, row_ptr, degree, x_gl)
+        inputs_ref = inputs_flash
+        ref_fn_actual = ref_fn
     else:
         return f"No benchmark for '{task}'"
 
